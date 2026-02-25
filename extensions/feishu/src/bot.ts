@@ -75,6 +75,8 @@ function extractPermissionError(err: unknown): PermissionError | null {
 // Cache display names by open_id to avoid an API call on every message.
 const SENDER_NAME_TTL_MS = 10 * 60 * 1000;
 const senderNameCache = new Map<string, { name: string; expireAt: number }>();
+const senderNamePermissionDeniedUntil = new Map<string, number>();
+const SENDER_NAME_PERMISSION_DENIED_TTL_MS = 30 * 60 * 1000;
 
 // Cache permission errors to avoid spamming the user with repeated notifications.
 // Key: appId or "default", Value: timestamp of last notification
@@ -98,6 +100,9 @@ async function resolveFeishuSenderName(params: {
   const cached = senderNameCache.get(senderOpenId);
   const now = Date.now();
   if (cached && cached.expireAt > now) return { name: cached.name };
+  const permissionCooldownKey = account.appId ?? "default";
+  const blockedUntil = senderNamePermissionDeniedUntil.get(permissionCooldownKey) ?? 0;
+  if (blockedUntil > now) return {};
 
   try {
     const client = createFeishuClient(account);
@@ -124,6 +129,10 @@ async function resolveFeishuSenderName(params: {
     // Check if this is a permission error
     const permErr = extractPermissionError(err);
     if (permErr) {
+      senderNamePermissionDeniedUntil.set(
+        permissionCooldownKey,
+        now + SENDER_NAME_PERMISSION_DENIED_TTL_MS,
+      );
       log(`feishu: permission error resolving sender name: code=${permErr.code}`);
       return { permissionError: permErr };
     }
@@ -524,12 +533,15 @@ export async function handleFeishuMessage(params: {
   const isGroup = ctx.chatType === "group";
   const senderUserId = event.sender.sender_id.user_id?.trim() || undefined;
 
-  // Resolve sender display name (best-effort) so the agent can attribute messages correctly.
-  const senderResult = await resolveFeishuSenderName({
-    account,
-    senderOpenId: ctx.senderOpenId,
-    log,
-  });
+  // Only group chats benefit from sender-name enrichment. Skip DM lookups to avoid
+  // unnecessary contact permission dependencies on the hot path.
+  const senderResult = isGroup
+    ? await resolveFeishuSenderName({
+        account,
+        senderOpenId: ctx.senderOpenId,
+        log,
+      })
+    : {};
   if (senderResult.name) ctx = { ...ctx, senderName: senderResult.name };
 
   // Track permission error to inform agent later (with cooldown to avoid repetition)
@@ -843,65 +855,13 @@ export async function handleFeishuMessage(params: {
 
     const envelopeFrom = isGroup ? `${ctx.chatId}:${ctx.senderOpenId}` : ctx.senderOpenId;
 
-    // If there's a permission error, dispatch a separate notification first
+    // Contact-profile permission errors don't block reply flow.
+    // Keep this as a log-only signal to avoid sending internal diagnostics to end users.
     if (permissionErrorForAgent) {
       const grantUrl = permissionErrorForAgent.grantUrl ?? "";
-      const permissionNotifyBody = `[System: The bot encountered a Feishu API permission error. Please inform the user about this issue and provide the permission grant URL for the admin to authorize. Permission grant URL: ${grantUrl}]`;
-
-      const permissionBody = core.channel.reply.formatAgentEnvelope({
-        channel: "Feishu",
-        from: envelopeFrom,
-        timestamp: new Date(),
-        envelope: envelopeOptions,
-        body: permissionNotifyBody,
-      });
-
-      const permissionCtx = core.channel.reply.finalizeInboundContext({
-        Body: permissionBody,
-        BodyForAgent: permissionNotifyBody,
-        RawBody: permissionNotifyBody,
-        CommandBody: permissionNotifyBody,
-        From: feishuFrom,
-        To: feishuTo,
-        SessionKey: route.sessionKey,
-        AccountId: route.accountId,
-        ChatType: isGroup ? "group" : "direct",
-        GroupSubject: isGroup ? ctx.chatId : undefined,
-        SenderName: "system",
-        SenderId: "system",
-        Provider: "feishu" as const,
-        Surface: "feishu" as const,
-        MessageSid: `${ctx.messageId}:permission-error`,
-        Timestamp: Date.now(),
-        WasMentioned: false,
-        CommandAuthorized: commandAuthorized,
-        OriginatingChannel: "feishu" as const,
-        OriginatingTo: feishuTo,
-      });
-
-      const {
-        dispatcher: permDispatcher,
-        replyOptions: permReplyOptions,
-        markDispatchIdle: markPermIdle,
-      } = createFeishuReplyDispatcher({
-        cfg,
-        agentId: route.agentId,
-        runtime: runtime as RuntimeEnv,
-        chatId: ctx.chatId,
-        replyToMessageId: ctx.messageId,
-        accountId: account.accountId,
-      });
-
-      log(`feishu[${account.accountId}]: dispatching permission error notification to agent`);
-
-      await core.channel.reply.dispatchReplyFromConfig({
-        ctx: permissionCtx,
-        cfg,
-        dispatcher: permDispatcher,
-        replyOptions: permReplyOptions,
-      });
-
-      markPermIdle();
+      log(
+        `feishu[${account.accountId}]: sender-name permission warning (suppressed user-facing notice, grantUrl=${grantUrl || "n/a"})`,
+      );
     }
 
     const body = core.channel.reply.formatAgentEnvelope({

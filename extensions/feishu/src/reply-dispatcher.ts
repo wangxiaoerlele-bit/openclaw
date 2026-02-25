@@ -16,9 +16,67 @@ import { FeishuStreamingSession } from "./streaming-card.js";
 import { resolveReceiveIdType } from "./targets.js";
 import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } from "./typing.js";
 
+const REASONING_HEADER = "Reasoning:\n";
+const THINK_TAG_BLOCK_RE =
+  /<\s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>[\s\S]*?<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi;
+const THINK_TAG_OPEN_RE = /<\s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>/i;
+const THINK_TAG_CLOSE_RE = /<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>/i;
+
 /** Detect if text contains markdown elements that benefit from card rendering */
 function shouldUseCard(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
+}
+
+function stripTaggedReasoning(text: string): string {
+  if (!text) {
+    return text;
+  }
+  let next = text.replace(THINK_TAG_BLOCK_RE, "");
+  const openMatch = THINK_TAG_OPEN_RE.exec(next);
+  if (openMatch && !THINK_TAG_CLOSE_RE.test(next.slice(openMatch.index))) {
+    next = next.slice(0, openMatch.index);
+  }
+  return next;
+}
+
+function stripFormattedReasoningPrefix(text: string): string {
+  let next = text;
+  while (next.trimStart().startsWith(REASONING_HEADER)) {
+    const leadingWsLength = next.length - next.trimStart().length;
+    const trimmedStart = next.slice(leadingWsLength);
+    const lines = trimmedStart.split(/\r?\n/);
+    if (lines[0] !== "Reasoning:") {
+      break;
+    }
+    let idx = 1;
+    while (idx < lines.length) {
+      const line = lines[idx] ?? "";
+      const trimmed = line.trim();
+      if (!trimmed) {
+        idx += 1;
+        continue;
+      }
+      // formatReasoningMessage() wraps each non-empty line in underscores.
+      if (/^_.+_$/.test(trimmed)) {
+        idx += 1;
+        continue;
+      }
+      break;
+    }
+    const remainder = lines.slice(idx).join("\n");
+    if (idx >= lines.length) {
+      next = "";
+      break;
+    }
+    next = remainder;
+  }
+  return next;
+}
+
+function sanitizeFeishuOutboundText(text: string): string {
+  const withoutTagged = stripTaggedReasoning(text);
+  const withoutFormattedPrefix = stripFormattedReasoningPrefix(withoutTagged);
+  return withoutFormattedPrefix.trimStart();
 }
 
 export type CreateFeishuReplyDispatcherParams = {
@@ -137,7 +195,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         void typingCallbacks.onReplyStart?.();
       },
       deliver: async (payload: ReplyPayload, info) => {
-        const text = payload.text ?? "";
+        const text = sanitizeFeishuOutboundText(payload.text ?? "");
         if (!text.trim()) {
           return;
         }
@@ -218,11 +276,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       onModelSelected: prefixContext.onModelSelected,
       onPartialReply: streamingEnabled
         ? (payload: ReplyPayload) => {
-            if (!payload.text || payload.text === lastPartial) {
+            const text = sanitizeFeishuOutboundText(payload.text ?? "");
+            if (!text || text === lastPartial) {
               return;
             }
-            lastPartial = payload.text;
-            streamText = payload.text;
+            lastPartial = text;
+            streamText = text;
             partialUpdateQueue = partialUpdateQueue.then(async () => {
               if (streamingStartPromise) {
                 await streamingStartPromise;

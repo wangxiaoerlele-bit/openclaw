@@ -9,6 +9,7 @@ const {
   mockSendMessageFeishu,
   mockGetMessageFeishu,
   mockDownloadMessageResourceFeishu,
+  mockCreateFeishuClient,
 } = vi.hoisted(() => ({
   mockCreateFeishuReplyDispatcher: vi.fn(() => ({
     dispatcher: vi.fn(),
@@ -22,6 +23,13 @@ const {
     contentType: "video/mp4",
     fileName: "clip.mp4",
   }),
+  mockCreateFeishuClient: vi.fn(() => ({
+    contact: {
+      user: {
+        get: vi.fn(),
+      },
+    },
+  })),
 }));
 
 vi.mock("./reply-dispatcher.js", () => ({
@@ -35,6 +43,10 @@ vi.mock("./send.js", () => ({
 
 vi.mock("./media.js", () => ({
   downloadMessageResourceFeishu: mockDownloadMessageResourceFeishu,
+}));
+
+vi.mock("./client.js", () => ({
+  createFeishuClient: mockCreateFeishuClient,
 }));
 
 function createRuntimeEnv(): RuntimeEnv {
@@ -72,6 +84,13 @@ describe("handleFeishuMessage command authorization", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockCreateFeishuClient.mockReturnValue({
+      contact: {
+        user: {
+          get: vi.fn(),
+        },
+      },
+    });
     setFeishuRuntime({
       system: {
         enqueueSystemEvent: vi.fn(),
@@ -150,6 +169,37 @@ describe("handleFeishuMessage command authorization", () => {
         Surface: "feishu",
       }),
     );
+  });
+
+  it("skips sender contact lookup for DMs even when app credentials are configured", async () => {
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          appId: "cli_test",
+          appSecret: "secret",
+          dmPolicy: "open",
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-dm-user",
+        },
+      },
+      message: {
+        message_id: "msg-dm-skip-sender-lookup",
+        chat_id: "oc-dm",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "hello" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event });
+
+    expect(mockCreateFeishuClient).not.toHaveBeenCalled();
   });
 
   it("reads pairing allow store for non-command DMs when dmPolicy is pairing", async () => {

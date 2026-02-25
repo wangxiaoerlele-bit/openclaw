@@ -11,6 +11,7 @@ TARGET_TAG=""
 CUSTOM_COMMIT_SUBJECTS=(
   "Feishu: suppress sender-name permission spam and strip reasoning"
   "Weather: make chat-safe wttr usage defaults"
+  "Dev: add local custom upgrade helper"
 )
 
 log() {
@@ -88,7 +89,7 @@ fi
 [[ -n "$TARGET_TAG" ]] || fail "Could not determine target tag"
 git rev-parse "${TARGET_TAG}^{commit}" >/dev/null 2>&1 || fail "Tag not found: $TARGET_TAG"
 
-BRANCH_NAME="local/${TARGET_TAG#v}-custom"
+BRANCH_NAME="local/${TARGET_TAG}-custom"
 log "==> Target tag: $TARGET_TAG"
 log "==> Target custom branch: $BRANCH_NAME"
 

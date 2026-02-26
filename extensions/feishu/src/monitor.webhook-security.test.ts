@@ -20,7 +20,21 @@ vi.mock("./probe.js", () => ({
 
 vi.mock("./client.js", () => ({
   createFeishuWSClient: vi.fn(() => ({ start: vi.fn() })),
-  createEventDispatcher: vi.fn(() => ({ register: vi.fn() })),
+  createEventDispatcher: vi.fn(() => ({
+    register: vi.fn(),
+    invoke: vi.fn(async () => undefined),
+    encryptKey: "",
+    verificationToken: "",
+  })),
+  createCardActionHandler: vi.fn(() => ({
+    invoke: vi.fn(async () => undefined),
+    requestHandle: { parse: vi.fn((v) => v) },
+    cardHandler: vi.fn(async () => undefined),
+  })),
+}));
+
+vi.mock("./memory-suggestion-actions.js", () => ({
+  handleFeishuPersonalMemoryCardAction: vi.fn(async () => undefined),
 }));
 
 import { monitorFeishuProvider, stopFeishuMonitor } from "./monitor.js";

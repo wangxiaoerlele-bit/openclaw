@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { loadSessionStore, resolveStorePath } from "../../config/sessions.js";
@@ -9,6 +11,23 @@ import {
   logMessageQueued,
   logSessionStateChange,
 } from "../../logging/diagnostic.js";
+import {
+  emitPersonalMemoryPostSuggestionDetailed,
+  inferPersonalMemoryTaskKindFromText,
+  inferPersonalMemoryUserConfirmedFromText,
+  runPersonalMemoryPreHook,
+} from "../../personal-memory/runtime-hooks.js";
+import { resolvePersonalMemoryChannelPolicy } from "../../personal-memory/settings.js";
+import {
+  applyQueuedPersonalMemorySuggestion,
+  dismissPersonalMemorySuggestion,
+  listPersonalMemorySuggestions,
+  PersonalMemorySuggestionQueueError,
+} from "../../personal-memory/suggestion-queue.js";
+import type {
+  PersonalMemoryChannel,
+  PersonalMemoryPreSessionContext,
+} from "../../personal-memory/types.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { maybeApplyTtsToPayload, normalizeTtsAutoMode, resolveTtsConfig } from "../../tts/tts.js";
 import { getReplyFromConfig } from "../reply.js";
@@ -17,7 +36,6 @@ import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { formatAbortReplyText, tryFastAbortFromMessage } from "./abort.js";
 import { shouldSkipDuplicateInbound } from "./inbound-dedupe.js";
 import type { ReplyDispatcher, ReplyDispatchKind } from "./reply-dispatcher.js";
-import { shouldSuppressReasoningPayload } from "./reply-payloads.js";
 import { isRoutableChannel, routeReply } from "./route-reply.js";
 
 const AUDIO_PLACEHOLDER_RE = /^<media:audio>(\s*\([^)]*\))?$/i;
@@ -80,6 +98,243 @@ export type DispatchFromConfigResult = {
   queuedFinal: boolean;
   counts: Record<ReplyDispatchKind, number>;
 };
+
+function resolvePersonalMemoryChannel(raw: string | undefined): PersonalMemoryChannel | undefined {
+  const normalized = raw?.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  const alias: Record<string, PersonalMemoryChannel> = {
+    webchat: "web-gui",
+    feishu: "feishu",
+    telegram: "telegram",
+    discord: "discord",
+    slack: "slack",
+    signal: "signal",
+    imessage: "imessage",
+    whatsapp: "whatsapp",
+    matrix: "matrix",
+    msteams: "msteams",
+    mattermost: "mattermost",
+    googlechat: "googlechat",
+    "nextcloud-talk": "nextcloud-talk",
+    irc: "irc",
+    zalo: "zalo",
+    zalouser: "zalouser",
+    bluebubbles: "bluebubbles",
+    tlon: "tlon",
+    twitch: "twitch",
+  };
+  return alias[normalized];
+}
+
+function resolveDefaultPersonalContextDir(): string | undefined {
+  const candidate = path.resolve(process.cwd(), "personal-context");
+  return fs.existsSync(candidate) ? candidate : undefined;
+}
+
+type ParsedPersonalMemoryDecisionFields = {
+  decisionTitle?: string;
+  background?: string;
+  decision?: string;
+  reason?: string;
+  next?: string;
+  links?: string;
+};
+
+type PersonalMemoryQueueInlineCommand =
+  | { action: "list"; status?: "pending" | "all" }
+  | { action: "apply"; id: string }
+  | { action: "dismiss"; id: string };
+
+function parsePersonalMemoryDecisionFieldsFromText(
+  text: string,
+): ParsedPersonalMemoryDecisionFields {
+  const parsed: ParsedPersonalMemoryDecisionFields = {};
+  const labelMap: Record<string, keyof ParsedPersonalMemoryDecisionFields> = {
+    决策标题: "decisionTitle",
+    标题: "decisionTitle",
+    background: "background",
+    背景: "background",
+    decision: "decision",
+    决策: "decision",
+    reason: "reason",
+    原因: "reason",
+    next: "next",
+    后续动作: "next",
+    下一步: "next",
+    links: "links",
+    相关文件: "links",
+    相关链接: "links",
+    链接: "links",
+  };
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+    const match = /^([A-Za-z\u4e00-\u9fa5]+)\s*[：:]\s*(.+)$/.exec(line);
+    if (!match) {
+      continue;
+    }
+    const rawLabel = match[1]?.trim();
+    const value = match[2]?.trim();
+    if (!rawLabel || !value) {
+      continue;
+    }
+    const key = labelMap[rawLabel] ?? labelMap[rawLabel.toLowerCase()];
+    if (!key || parsed[key]) {
+      continue;
+    }
+    parsed[key] = value;
+  }
+  return parsed;
+}
+
+function parsePersonalMemoryQueueInlineCommand(
+  text: string,
+): PersonalMemoryQueueInlineCommand | undefined {
+  const firstLine = text.split(/\r?\n/, 1)[0]?.trim();
+  if (!firstLine) {
+    return undefined;
+  }
+
+  let m = /^(?:记忆建议|记忆队列)\s*(?:列表|list|ls)?\s*(全部|all)?$/i.exec(firstLine);
+  if (m) {
+    return { action: "list", status: m[1] ? "all" : "pending" };
+  }
+  m = /^(?:memory\s+suggestions)(?:\s+(all))?$/i.exec(firstLine);
+  if (m) {
+    return { action: "list", status: m[1] ? "all" : "pending" };
+  }
+
+  m = /^(?:记忆(?:建议)?\s*应用|memory\s+apply)\s+(pms_[a-z0-9_-]+)$/i.exec(firstLine);
+  if (m?.[1]) {
+    return { action: "apply", id: m[1] };
+  }
+  m = /^(?:记忆(?:建议)?\s*(?:忽略|驳回)|memory\s+(?:dismiss|reject))\s+(pms_[a-z0-9_-]+)$/i.exec(
+    firstLine,
+  );
+  if (m?.[1]) {
+    return { action: "dismiss", id: m[1] };
+  }
+  return undefined;
+}
+
+function buildPersonalMemorySuggestionSummaryLine(params: {
+  id: string;
+  status: string;
+  level: string;
+  target?: string;
+  title?: string;
+  channel?: string;
+}): string {
+  const parts = [
+    params.id,
+    `[${params.status}]`,
+    params.level,
+    params.target ? `target=${params.target}` : undefined,
+    params.channel ? `ch=${params.channel}` : undefined,
+    params.title ? `title=${params.title}` : undefined,
+  ].filter(Boolean);
+  return `- ${parts.join(" | ")}`;
+}
+
+function formatPersonalMemoryInlineCommandReply(params: {
+  command: PersonalMemoryQueueInlineCommand;
+  personalContextDir: string;
+}): string {
+  try {
+    if (params.command.action === "list") {
+      const status = params.command.status ?? "pending";
+      const result = listPersonalMemorySuggestions({
+        personalContextDir: params.personalContextDir,
+        status,
+        limit: 10,
+      });
+      if (result.items.length === 0) {
+        return `记忆建议队列为空（status=${status}）`;
+      }
+      const lines = [
+        `记忆建议队列（status=${status}，显示前 ${result.items.length} 条）`,
+        ...result.items.map((item) =>
+          buildPersonalMemorySuggestionSummaryLine({
+            id: item.id,
+            status: item.status,
+            level: item.suggestion.level,
+            target: item.suggestion.target,
+            title: item.suggestion.title ?? item.suggestion.structured?.title,
+            channel: item.source.channel,
+          }),
+        ),
+        "",
+        "可用命令：",
+        "记忆应用 pms_xxx",
+        "记忆忽略 pms_xxx",
+      ];
+      return lines.join("\n");
+    }
+    if (params.command.action === "apply") {
+      const applied = applyQueuedPersonalMemorySuggestion({
+        personalContextDir: params.personalContextDir,
+        id: params.command.id,
+      });
+      return [
+        `记忆建议已应用：${applied.item.id}`,
+        `状态：${applied.item.status}`,
+        `标题：${applied.applyResult.title ?? "-"}`,
+        `写入：${applied.applyResult.applied ? "yes" : "no"}`,
+        `重复：${applied.applyResult.alreadyExists ? "yes" : "no"}`,
+      ].join("\n");
+    }
+    const dismissed = dismissPersonalMemorySuggestion({
+      personalContextDir: params.personalContextDir,
+      id: params.command.id,
+    });
+    return `记忆建议已忽略：${dismissed.id}\n状态：${dismissed.status}`;
+  } catch (err) {
+    if (err instanceof PersonalMemorySuggestionQueueError) {
+      return `记忆建议操作失败：${err.message}`;
+    }
+    return `记忆建议操作失败：${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+function buildFeishuPersonalMemorySuggestionReply(params: {
+  queueId: string;
+  suggestionLevel: string;
+  target?: string;
+  title?: string;
+  reason?: string;
+  commitCommand?: string;
+}): ReplyPayload {
+  const canApply = Boolean(params.commitCommand);
+  const lines = [
+    `已生成记忆建议：${params.queueId}`,
+    `级别：${params.suggestionLevel}${params.target ? ` (target=${params.target})` : ""}`,
+    params.title ? `标题：${params.title}` : undefined,
+    params.reason ? `原因：${params.reason}` : undefined,
+    "",
+    canApply ? `可直接点击按钮处理，或发送：记忆应用 ${params.queueId}` : undefined,
+    `也可发送：记忆忽略 ${params.queueId}`,
+  ].filter(Boolean) as string[];
+  return {
+    text: lines.join("\n"),
+    channelData: {
+      feishu: {
+        personalMemorySuggestionAction: {
+          queueId: params.queueId,
+          level: params.suggestionLevel,
+          target: params.target,
+          title: params.title,
+          reason: params.reason,
+          canApply,
+        },
+      },
+    },
+  };
+}
 
 export async function dispatchReplyFromConfig(params: {
   ctx: FinalizedMsgContext;
@@ -164,8 +419,55 @@ export async function dispatchReplyFromConfig(params: {
         : typeof ctx.Body === "string"
           ? ctx.Body
           : "";
+  const personalMemoryContent =
+    typeof ctx.RawBody === "string"
+      ? ctx.RawBody
+      : typeof ctx.BodyForCommands === "string"
+        ? ctx.BodyForCommands
+        : typeof ctx.Body === "string"
+          ? ctx.Body
+          : "";
   const channelId = (ctx.OriginatingChannel ?? ctx.Surface ?? ctx.Provider ?? "").toLowerCase();
   const conversationId = ctx.OriginatingTo ?? ctx.To ?? ctx.From ?? undefined;
+  const personalMemoryChannel = resolvePersonalMemoryChannel(channelId);
+  const personalContextDir = personalMemoryChannel ? resolveDefaultPersonalContextDir() : undefined;
+  let personalMemoryPolicy: ReturnType<typeof resolvePersonalMemoryChannelPolicy> | undefined;
+  if (personalMemoryChannel && personalContextDir) {
+    try {
+      personalMemoryPolicy = resolvePersonalMemoryChannelPolicy({
+        personalContextDir,
+        channel: personalMemoryChannel,
+      });
+    } catch (err) {
+      logVerbose(
+        `dispatch-from-config: personal-memory settings failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      personalMemoryPolicy = undefined;
+    }
+  }
+  const runIdForMemory =
+    typeof params.replyOptions?.runId === "string" && params.replyOptions.runId.trim()
+      ? params.replyOptions.runId
+      : typeof messageIdForHook === "string" && messageIdForHook.trim()
+        ? `pm:${messageIdForHook}`
+        : undefined;
+  const shouldSkipPersonalMemory =
+    !personalMemoryChannel ||
+    !personalContextDir ||
+    !personalMemoryPolicy ||
+    (!personalMemoryPolicy.preHookEnabled && !personalMemoryPolicy.postHookEnabled) ||
+    !sessionKey ||
+    typeof ctx.BodyForAgent !== "string" ||
+    (personalMemoryChannel === "web-gui" && personalMemoryContent.trim().startsWith("/"));
+  const inlineQueueCommand =
+    personalMemoryChannel &&
+    personalMemoryChannel !== "web-gui" &&
+    ctx.ChatType !== "group" &&
+    personalContextDir &&
+    personalMemoryPolicy?.enabled
+      ? parsePersonalMemoryQueueInlineCommand(personalMemoryContent)
+      : undefined;
+  let personalMemoryPre: PersonalMemoryPreSessionContext | undefined;
 
   // Trigger plugin hooks (fire-and-forget)
   if (hookRunner?.hasHooks("message_received")) {
@@ -279,6 +581,61 @@ export async function dispatchReplyFromConfig(params: {
   markProcessing();
 
   try {
+    if (inlineQueueCommand && personalContextDir) {
+      const payload = {
+        text: formatPersonalMemoryInlineCommandReply({
+          command: inlineQueueCommand,
+          personalContextDir,
+        }),
+      } satisfies ReplyPayload;
+      let queuedFinal = false;
+      let routedFinalCount = 0;
+      if (shouldRouteToOriginating && originatingChannel && originatingTo) {
+        const result = await routeReply({
+          payload,
+          channel: originatingChannel,
+          to: originatingTo,
+          sessionKey: ctx.SessionKey,
+          accountId: ctx.AccountId,
+          threadId: ctx.MessageThreadId,
+          cfg,
+        });
+        queuedFinal = result.ok;
+        if (result.ok) {
+          routedFinalCount += 1;
+        }
+      } else {
+        queuedFinal = dispatcher.sendFinalReply(payload);
+      }
+      const counts = dispatcher.getQueuedCounts();
+      counts.final += routedFinalCount;
+      recordProcessed("completed", {
+        reason: `personal_memory_queue_${inlineQueueCommand.action}`,
+      });
+      markIdle("message_completed");
+      return { queuedFinal, counts };
+    }
+
+    if (
+      !shouldSkipPersonalMemory &&
+      runIdForMemory &&
+      sessionKey &&
+      personalContextDir &&
+      personalMemoryChannel &&
+      typeof ctx.BodyForAgent === "string"
+    ) {
+      const preResult = await runPersonalMemoryPreHook({
+        runId: runIdForMemory,
+        sessionKey,
+        messageText: personalMemoryContent,
+        bodyForAgent: ctx.BodyForAgent,
+        personalContextDir,
+        channel: personalMemoryChannel,
+      });
+      ctx.BodyForAgent = preResult.bodyForAgent;
+      personalMemoryPre = preResult.pre;
+    }
+
     const fastAbort = await tryFastAbortFromMessage({ ctx, cfg });
     if (fastAbort.handled) {
       const payload = {
@@ -364,12 +721,6 @@ export async function dispatchReplyFromConfig(params: {
         },
         onBlockReply: (payload: ReplyPayload, context) => {
           const run = async () => {
-            // Suppress reasoning payloads — channels using this generic dispatch
-            // path (WhatsApp, web, etc.) do not have a dedicated reasoning lane.
-            // Telegram has its own dispatch path that handles reasoning splitting.
-            if (shouldSuppressReasoningPayload(payload)) {
-              return;
-            }
             // Accumulate block text for TTS generation after streaming
             if (payload.text) {
               if (accumulatedBlockText.length > 0) {
@@ -403,11 +754,6 @@ export async function dispatchReplyFromConfig(params: {
     let queuedFinal = false;
     let routedFinalCount = 0;
     for (const reply of replies) {
-      // Suppress reasoning payloads from channel delivery — channels using this
-      // generic dispatch path do not have a dedicated reasoning lane.
-      if (shouldSuppressReasoningPayload(reply)) {
-        continue;
-      }
       const ttsReply = await maybeApplyTtsToPayload({
         payload: reply,
         cfg,
@@ -500,6 +846,68 @@ export async function dispatchReplyFromConfig(params: {
 
     const counts = dispatcher.getQueuedCounts();
     counts.final += routedFinalCount;
+    const replySummary = replies
+      .map((reply) => (typeof reply.text === "string" ? reply.text.trim() : ""))
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+    const summaryForPost = replySummary || accumulatedBlockText.trim();
+    const inferredTaskKind =
+      personalMemoryPre?.request.taskKind ??
+      inferPersonalMemoryTaskKindFromText(personalMemoryContent);
+    const decisionFields =
+      inferredTaskKind === "decision-review"
+        ? parsePersonalMemoryDecisionFieldsFromText(personalMemoryContent)
+        : {};
+    if (
+      !shouldSkipPersonalMemory &&
+      runIdForMemory &&
+      summaryForPost &&
+      sessionKey &&
+      personalContextDir &&
+      personalMemoryChannel
+    ) {
+      const postMemory = emitPersonalMemoryPostSuggestionDetailed({
+        runId: runIdForMemory,
+        sessionKey,
+        personalContextDir,
+        input: {
+          channel: personalMemoryChannel,
+          taskKind: inferredTaskKind,
+          summary: summaryForPost,
+          userConfirmed:
+            inferredTaskKind === "decision-review" &&
+            inferPersonalMemoryUserConfirmedFromText(personalMemoryContent),
+          decisionTitle: decisionFields.decisionTitle,
+          background: decisionFields.background,
+          decision: decisionFields.decision,
+          reason: decisionFields.reason,
+          next: decisionFields.next,
+          links: decisionFields.links,
+        },
+      });
+      if (
+        personalMemoryChannel === "feishu" &&
+        ctx.ChatType !== "group" &&
+        postMemory.queueId &&
+        postMemory.suggestion.level !== "L0"
+      ) {
+        const didQueue = dispatcher.sendFinalReply(
+          buildFeishuPersonalMemorySuggestionReply({
+            queueId: postMemory.queueId,
+            suggestionLevel: postMemory.suggestion.level,
+            target: postMemory.suggestion.target,
+            title: postMemory.suggestion.title ?? postMemory.suggestion.structured?.title,
+            reason: postMemory.suggestion.reason,
+            commitCommand: postMemory.commitCommand,
+          }),
+        );
+        queuedFinal = didQueue || queuedFinal;
+        if (didQueue) {
+          counts.final += 1;
+        }
+      }
+    }
     recordProcessed("completed");
     markIdle("message_completed");
     return { queuedFinal, counts };

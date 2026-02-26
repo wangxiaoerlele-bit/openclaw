@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "enabled": true,
+  "runtimeGc": {
+    "enabled": false,
+    "runOnPostHook": true,
+    "minIntervalMinutes": 30,
+    "archiveRuntimeEpisodicDays": 30,
+    "retainEpisodicByChannelDays": {
+      "feishu": 14,
+      "web-gui": 30
+    },
+    "protectEpisodicTags": ["pinned"],
+    "protectEpisodicSources": ["manual"],
+    "retainWorkingHours": 24,
+    "retainEpisodicDays": 30,
+    "retainAppliedDays": 30,
+    "retainDismissedDays": 14,
+    "keepPending": 200,
+    "maxEpisodic": 200
+  },
+  "runtimeSync": {
+    "enabled": false,
+    "runOnPreHook": false,
+    "runOnPostHook": true,
+    "minIntervalMinutes": 30,
+    "preMinIntervalMinutes": 15,
+    "postMinIntervalMinutes": 30,
+    "mode": "export",
+    "preMode": "import",
+    "postMode": "sync",
+    "conflictStrategy": "latest",
+    "channels": ["feishu", "web-gui"],
+    "auditConflicts": false,
+    "auditFile": "archive/runtime-memory-auto-sync.audit.jsonl",
+    "bundleFile": "archive/runtime-memory-share.json",
+    "includeWorking": false,
+    "maxEpisodic": 200
+  },
+  "channels": {
+    "web-gui": {
+      "enabled": true,
+      "preHook": true,
+      "postHook": true,
+      "search": {
+        "enabled": true,
+        "mode": "hybrid",
+        "limit": 3,
+        "cache": true,
+        "rerank": true,
+        "rerankTopK": 12,
+        "backend": "sparse-cache"
+      }
+    },
+    "feishu": {
+      "enabled": true,
+      "search": {
+        "limit": 2,
+        "rerank": true,
+        "rerankTopK": 10
+      }
+    },
+    "telegram": {
+      "enabled": false,
+      "preHook": true,
+      "postHook": false,
+      "budget": {
+        "maxRecords": 6,
+        "maxChars": 5000
+      },
+      "search": {
+        "enabled": true,
+        "mode": "keyword",
+        "limit": 2,
+        "layers": ["episodic", "semantic"],
+        "backend": "sqlite-vec",
+        "sqliteVecFile": ".semantic-index.sqlite"
+      }
+    }
+  }
+}

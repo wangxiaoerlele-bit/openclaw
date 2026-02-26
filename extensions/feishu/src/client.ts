@@ -1,6 +1,16 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
 import type { FeishuDomain, ResolvedFeishuAccount } from "./types.js";
 
+type WSEventFrame = {
+  headers?: Array<{ key?: string; value?: string }>;
+  payload?: Uint8Array;
+};
+
+type WSClientInternalHandle = {
+  handleEventData?: (data: WSEventFrame) => Promise<void>;
+  __ocCardCompatPatched?: boolean;
+};
+
 // Multi-account client cache
 const clientCache = new Map<
   string,
@@ -81,12 +91,47 @@ export function createFeishuWSClient(account: ResolvedFeishuAccount): Lark.WSCli
     throw new Error(`Feishu credentials not configured for account "${accountId}"`);
   }
 
-  return new Lark.WSClient({
+  const wsClient = new Lark.WSClient({
     appId,
     appSecret,
     domain: resolveDomain(domain),
     loggerLevel: Lark.LoggerLevel.info,
   });
+  patchFeishuWSClientCardFrameCompat(wsClient);
+  return wsClient;
+}
+
+function remapCardFrameToEvent(frame: WSEventFrame): WSEventFrame {
+  const headers = frame.headers ?? [];
+  let changed = false;
+  const mapped = headers.map((header) => {
+    if (header?.key === "type" && header.value === "card") {
+      changed = true;
+      return { ...header, value: "event" };
+    }
+    return header;
+  });
+  if (!changed) {
+    return frame;
+  }
+  return { ...frame, headers: mapped };
+}
+
+// SDK WSClient currently ignores `type=card` frames in handleEventData. Card action callbacks
+// arrive as card frames over websocket, so we remap them to the event path on this instance only.
+export function patchFeishuWSClientCardFrameCompat(wsClient: Lark.WSClient): void {
+  const client = wsClient as unknown as WSClientInternalHandle;
+  if (client.__ocCardCompatPatched) {
+    return;
+  }
+  const originalHandleEventData = client.handleEventData?.bind(wsClient);
+  if (!originalHandleEventData) {
+    return;
+  }
+  client.handleEventData = async (frame: WSEventFrame): Promise<void> => {
+    await originalHandleEventData(remapCardFrameToEvent(frame));
+  };
+  client.__ocCardCompatPatched = true;
 }
 
 /**
@@ -97,6 +142,19 @@ export function createEventDispatcher(account: ResolvedFeishuAccount): Lark.Even
     encryptKey: account.encryptKey,
     verificationToken: account.verificationToken,
   });
+}
+
+export function createCardActionHandler(
+  account: ResolvedFeishuAccount,
+  cardHandler: (event: unknown) => Promise<unknown> | unknown,
+): Lark.CardActionHandler {
+  return new Lark.CardActionHandler(
+    {
+      encryptKey: account.encryptKey,
+      verificationToken: account.verificationToken,
+    },
+    cardHandler,
+  );
 }
 
 /**

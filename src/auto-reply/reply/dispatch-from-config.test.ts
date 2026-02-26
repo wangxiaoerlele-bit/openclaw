@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
 import type { MsgContext } from "../templating.js";
@@ -29,6 +32,17 @@ const hookMocks = vi.hoisted(() => ({
 const internalHookMocks = vi.hoisted(() => ({
   createInternalHookEvent: vi.fn(),
   triggerInternalHook: vi.fn(async () => {}),
+}));
+const personalMemoryMocks = vi.hoisted(() => ({
+  runPersonalMemoryPreHook: vi.fn(async (params: { bodyForAgent: string }) => ({
+    bodyForAgent: params.bodyForAgent,
+  })),
+  emitPersonalMemoryPostSuggestion: vi.fn(),
+  emitPersonalMemoryPostSuggestionDetailed: vi.fn(() => ({
+    suggestion: { level: "L0", reason: "no-op" },
+  })),
+  inferPersonalMemoryTaskKindFromText: vi.fn(() => "unknown"),
+  inferPersonalMemoryUserConfirmedFromText: vi.fn(() => false),
 }));
 
 vi.mock("./route-reply.js", () => ({
@@ -64,6 +78,15 @@ vi.mock("../../hooks/internal-hooks.js", () => ({
   createInternalHookEvent: internalHookMocks.createInternalHookEvent,
   triggerInternalHook: internalHookMocks.triggerInternalHook,
 }));
+vi.mock("../../personal-memory/runtime-hooks.js", () => ({
+  runPersonalMemoryPreHook: personalMemoryMocks.runPersonalMemoryPreHook,
+  emitPersonalMemoryPostSuggestion: personalMemoryMocks.emitPersonalMemoryPostSuggestion,
+  emitPersonalMemoryPostSuggestionDetailed:
+    personalMemoryMocks.emitPersonalMemoryPostSuggestionDetailed,
+  inferPersonalMemoryTaskKindFromText: personalMemoryMocks.inferPersonalMemoryTaskKindFromText,
+  inferPersonalMemoryUserConfirmedFromText:
+    personalMemoryMocks.inferPersonalMemoryUserConfirmedFromText,
+}));
 
 const { dispatchReplyFromConfig } = await import("./dispatch-from-config.js");
 const { resetInboundDedupe } = await import("./inbound-dedupe.js");
@@ -81,6 +104,31 @@ function createDispatcher(): ReplyDispatcher {
     getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
     markComplete: vi.fn(),
   };
+}
+
+function createPersonalContextCwdFixture(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-dispatch-memory-"));
+  fs.mkdirSync(path.join(dir, "personal-context"), { recursive: true });
+  return dir;
+}
+
+function seedDecisionLogForDispatchFixture(cwdDir: string) {
+  fs.writeFileSync(
+    path.join(cwdDir, "personal-context", "04-decision-log.md"),
+    `# 04 Decision Log
+
+- 最后更新日期： 2026-02-25
+
+## 决策记录
+
+### [2026-02-25] 基线记录
+
+- 背景：A
+- 决策：B
+- 原因：C
+`,
+    "utf8",
+  );
 }
 
 function setNoAbort() {
@@ -105,6 +153,10 @@ async function dispatchTwiceWithFreshDispatchers(params: Omit<DispatchReplyArgs,
 }
 
 describe("dispatchReplyFromConfig", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   beforeEach(() => {
     resetInboundDedupe();
     diagnosticMocks.logMessageQueued.mockClear();
@@ -116,6 +168,16 @@ describe("dispatchReplyFromConfig", () => {
     internalHookMocks.createInternalHookEvent.mockClear();
     internalHookMocks.createInternalHookEvent.mockImplementation(createInternalHookEventPayload);
     internalHookMocks.triggerInternalHook.mockClear();
+    personalMemoryMocks.runPersonalMemoryPreHook.mockClear();
+    personalMemoryMocks.emitPersonalMemoryPostSuggestion.mockClear();
+    personalMemoryMocks.emitPersonalMemoryPostSuggestionDetailed.mockClear();
+    personalMemoryMocks.inferPersonalMemoryTaskKindFromText.mockClear();
+    personalMemoryMocks.inferPersonalMemoryUserConfirmedFromText.mockClear();
+    personalMemoryMocks.runPersonalMemoryPreHook.mockImplementation(
+      async (params: { bodyForAgent: string }) => ({ bodyForAgent: params.bodyForAgent }),
+    );
+    personalMemoryMocks.inferPersonalMemoryTaskKindFromText.mockReturnValue("unknown");
+    personalMemoryMocks.inferPersonalMemoryUserConfirmedFromText.mockReturnValue(false);
   });
   it("does not route when Provider matches OriginatingChannel (even if Surface is missing)", async () => {
     setNoAbort();
@@ -167,6 +229,401 @@ describe("dispatchReplyFromConfig", () => {
         to: "telegram:999",
         accountId: "acc-1",
         threadId: 123,
+      }),
+    );
+  });
+
+  it("runs shared personal-memory pre/post hooks for feishu messages", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const cwdDir = createPersonalContextCwdFixture();
+    vi.spyOn(process, "cwd").mockReturnValue(cwdDir);
+    const ctx = buildTestCtx({
+      Provider: "feishu",
+      Surface: "feishu",
+      SessionKey: "feishu-main",
+      BodyForAgent: "今天天气怎么样",
+      BodyForCommands: "今天天气怎么样",
+      RawBody: "今天天气怎么样",
+      Body: "今天天气怎么样",
+      MessageSid: "msg-1",
+    });
+
+    const replyResolver = async () => ({ text: "晴天" }) satisfies ReplyPayload;
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyResolver,
+      replyOptions: { runId: "run-feishu-1" },
+    });
+
+    expect(personalMemoryMocks.runPersonalMemoryPreHook).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "run-feishu-1",
+        sessionKey: "feishu-main",
+        channel: "feishu",
+      }),
+    );
+    expect(personalMemoryMocks.emitPersonalMemoryPostSuggestionDetailed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "run-feishu-1",
+        sessionKey: "feishu-main",
+        input: expect.objectContaining({
+          channel: "feishu",
+          summary: "晴天",
+        }),
+      }),
+    );
+  });
+
+  it("handles external inline memory queue list command without invoking agent reply", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const cwdDir = createPersonalContextCwdFixture();
+    vi.spyOn(process, "cwd").mockReturnValue(cwdDir);
+    fs.writeFileSync(
+      path.join(cwdDir, "personal-context", ".personal-memory.suggestions.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          items: [
+            {
+              id: "pms_test_list",
+              createdAt: "2026-02-26T00:00:00.000Z",
+              updatedAt: "2026-02-26T00:00:00.000Z",
+              status: "pending",
+              fingerprint: "fp1",
+              source: { channel: "feishu" },
+              suggestion: {
+                level: "L1",
+                target: "current-focus",
+                reason: "测试",
+                title: "更新当前重点",
+              },
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const ctx = buildTestCtx({
+      Provider: "feishu",
+      Surface: "feishu",
+      SessionKey: "feishu-main",
+      ChatType: "direct",
+      BodyForAgent: "记忆建议 列表",
+      BodyForCommands: "记忆建议 列表",
+      RawBody: "记忆建议 列表",
+      Body: "记忆建议 列表",
+      MessageSid: "msg-list-1",
+    });
+    const replyResolver = vi.fn(async () => ({ text: "should not run" }) as ReplyPayload);
+
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyResolver,
+    });
+
+    expect(replyResolver).not.toHaveBeenCalled();
+    expect(personalMemoryMocks.runPersonalMemoryPreHook).not.toHaveBeenCalled();
+    expect(personalMemoryMocks.emitPersonalMemoryPostSuggestionDetailed).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("pms_test_list"),
+      }),
+    );
+  });
+
+  it("handles external inline memory queue apply command and writes decision-log", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const cwdDir = createPersonalContextCwdFixture();
+    vi.spyOn(process, "cwd").mockReturnValue(cwdDir);
+    seedDecisionLogForDispatchFixture(cwdDir);
+    fs.writeFileSync(
+      path.join(cwdDir, "personal-context", ".personal-memory.suggestions.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          items: [
+            {
+              id: "pms_test_apply",
+              createdAt: "2026-02-26T00:00:00.000Z",
+              updatedAt: "2026-02-26T00:00:00.000Z",
+              status: "pending",
+              fingerprint: "fp_apply",
+              source: { channel: "feishu" },
+              suggestion: {
+                level: "L2",
+                target: "decision-log",
+                reason: "测试",
+                structured: {
+                  date: "2026-02-26",
+                  title: "通过消息内命令应用建议",
+                  background: "验证外部渠道消息内确认闭环",
+                  decision: "支持文本命令 apply",
+                  reason: "无需切到 CLI",
+                },
+              },
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const ctx = buildTestCtx({
+      Provider: "feishu",
+      Surface: "feishu",
+      SessionKey: "feishu-main",
+      ChatType: "direct",
+      BodyForAgent: "记忆应用 pms_test_apply",
+      BodyForCommands: "记忆应用 pms_test_apply",
+      RawBody: "记忆应用 pms_test_apply",
+      Body: "记忆应用 pms_test_apply",
+      MessageSid: "msg-apply-1",
+    });
+    const replyResolver = vi.fn(async () => ({ text: "should not run" }) as ReplyPayload);
+
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyResolver,
+    });
+
+    expect(replyResolver).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("记忆建议已应用"),
+      }),
+    );
+    const queueText = fs.readFileSync(
+      path.join(cwdDir, "personal-context", ".personal-memory.suggestions.json"),
+      "utf8",
+    );
+    expect(queueText).toContain('"status": "applied"');
+    const logText = fs.readFileSync(
+      path.join(cwdDir, "personal-context", "04-decision-log.md"),
+      "utf8",
+    );
+    expect(logText).toContain("### [2026-02-26] 通过消息内命令应用建议");
+  });
+
+  it("passes userConfirmed=true to post hook for explicit decision confirmation messages", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const cwdDir = createPersonalContextCwdFixture();
+    vi.spyOn(process, "cwd").mockReturnValue(cwdDir);
+    personalMemoryMocks.inferPersonalMemoryTaskKindFromText.mockReturnValue("decision-review");
+    personalMemoryMocks.inferPersonalMemoryUserConfirmedFromText.mockReturnValue(true);
+    const ctx = buildTestCtx({
+      Provider: "feishu",
+      Surface: "feishu",
+      SessionKey: "feishu-main",
+      BodyForAgent:
+        "我确认采用这个方案，请记录决策\n决策标题：确认 personal-memory 方案\n背景：需要降低返工\n决策：先接入确认识别\n原因：这样才能在 Feishu 触发 L2\n下一步：验证 apply 闭环",
+      BodyForCommands:
+        "我确认采用这个方案，请记录决策\n决策标题：确认 personal-memory 方案\n背景：需要降低返工\n决策：先接入确认识别\n原因：这样才能在 Feishu 触发 L2\n下一步：验证 apply 闭环",
+      RawBody:
+        "我确认采用这个方案，请记录决策\n决策标题：确认 personal-memory 方案\n背景：需要降低返工\n决策：先接入确认识别\n原因：这样才能在 Feishu 触发 L2\n下一步：验证 apply 闭环",
+      Body: "我确认采用这个方案，请记录决策\n决策标题：确认 personal-memory 方案\n背景：需要降低返工\n决策：先接入确认识别\n原因：这样才能在 Feishu 触发 L2\n下一步：验证 apply 闭环",
+      MessageSid: "msg-confirm-1",
+    });
+
+    const replyResolver = async () => ({ text: "已确认，给出实施步骤" }) satisfies ReplyPayload;
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyResolver,
+      replyOptions: { runId: "run-feishu-confirm-1" },
+    });
+
+    expect(personalMemoryMocks.inferPersonalMemoryUserConfirmedFromText).toHaveBeenCalledWith(
+      expect.stringContaining("我确认采用这个方案，请记录决策"),
+    );
+    expect(personalMemoryMocks.emitPersonalMemoryPostSuggestionDetailed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          taskKind: "decision-review",
+          userConfirmed: true,
+          decisionTitle: "确认 personal-memory 方案",
+          background: "需要降低返工",
+          decision: "先接入确认识别",
+          reason: "这样才能在 Feishu 触发 L2",
+          next: "验证 apply 闭环",
+        }),
+      }),
+    );
+  });
+
+  it("queues Feishu native suggestion action payload when post hook returns a queue id", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const cwdDir = createPersonalContextCwdFixture();
+    vi.spyOn(process, "cwd").mockReturnValue(cwdDir);
+    personalMemoryMocks.emitPersonalMemoryPostSuggestionDetailed.mockReturnValueOnce({
+      suggestion: {
+        level: "L2",
+        target: "decision-log",
+        reason: "confirmed decision",
+        title: "确认 personal-memory 方案",
+        structured: { title: "确认 personal-memory 方案" },
+      },
+      queueId: "pms_test_001",
+      commitCommand: "pnpm memory:add-decision ...",
+    } as unknown as {
+      suggestion: {
+        level: string;
+        reason: string;
+        target?: string;
+        title?: string;
+        structured?: Record<string, string>;
+      };
+      queueId: string;
+      commitCommand: string;
+    });
+    const ctx = buildTestCtx({
+      Provider: "feishu",
+      Surface: "feishu",
+      ChatType: "direct",
+      SessionKey: "feishu-main",
+      BodyForAgent: "我确认采用这个方案",
+      BodyForCommands: "我确认采用这个方案",
+      RawBody: "我确认采用这个方案",
+      Body: "我确认采用这个方案",
+      MessageSid: "msg-confirm-card-1",
+    });
+
+    const replyResolver = async () => ({ text: "已确认，给出实施步骤" }) satisfies ReplyPayload;
+    const result = await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyResolver,
+      replyOptions: { runId: "run-feishu-confirm-card-1" },
+    });
+
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("pms_test_001"),
+        channelData: {
+          feishu: {
+            personalMemorySuggestionAction: expect.objectContaining({
+              queueId: "pms_test_001",
+              level: "L2",
+              target: "decision-log",
+              canApply: true,
+            }),
+          },
+        },
+      }),
+    );
+    expect(result.counts.final).toBe(1);
+  });
+
+  it("does not run personal-memory hooks for mapped channels unless enabled in settings", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const cwdDir = createPersonalContextCwdFixture();
+    vi.spyOn(process, "cwd").mockReturnValue(cwdDir);
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      Surface: "telegram",
+      SessionKey: "tg-main",
+      BodyForAgent: "帮我梳理今天的工作重点",
+      BodyForCommands: "帮我梳理今天的工作重点",
+      RawBody: "帮我梳理今天的工作重点",
+      Body: "帮我梳理今天的工作重点",
+      MessageSid: "tg-msg-1",
+    });
+
+    const replyResolver = async () => ({ text: "收到" }) satisfies ReplyPayload;
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyResolver,
+      replyOptions: { runId: "run-tg-1" },
+    });
+
+    expect(personalMemoryMocks.runPersonalMemoryPreHook).not.toHaveBeenCalled();
+    expect(personalMemoryMocks.emitPersonalMemoryPostSuggestionDetailed).not.toHaveBeenCalled();
+  });
+
+  it("skips shared personal-memory hooks for webchat slash commands", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const cwdDir = createPersonalContextCwdFixture();
+    vi.spyOn(process, "cwd").mockReturnValue(cwdDir);
+    const ctx = buildTestCtx({
+      Provider: "webchat",
+      Surface: "webchat",
+      SessionKey: "main",
+      BodyForAgent: "/help",
+      BodyForCommands: "/help",
+      RawBody: "/help",
+      Body: "/help",
+      MessageSid: "msg-web-1",
+    });
+
+    const replyResolver = async () => ({ text: "ok" }) satisfies ReplyPayload;
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyResolver,
+      replyOptions: { runId: "run-web-1" },
+    });
+
+    expect(personalMemoryMocks.runPersonalMemoryPreHook).not.toHaveBeenCalled();
+    expect(personalMemoryMocks.emitPersonalMemoryPostSuggestionDetailed).not.toHaveBeenCalled();
+  });
+
+  it("uses RawBody for webchat personal-memory classification when BodyForCommands injects /think", async () => {
+    setNoAbort();
+    const cfg = emptyConfig;
+    const dispatcher = createDispatcher();
+    const cwdDir = createPersonalContextCwdFixture();
+    vi.spyOn(process, "cwd").mockReturnValue(cwdDir);
+    const ctx = buildTestCtx({
+      Provider: "webchat",
+      Surface: "webchat",
+      SessionKey: "main",
+      BodyForAgent: "请帮我规划下周安排",
+      BodyForCommands: "/think low 请帮我规划下周安排",
+      RawBody: "请帮我规划下周安排",
+      Body: "请帮我规划下周安排",
+      MessageSid: "msg-web-think-1",
+    });
+
+    const replyResolver = async () => ({ text: "好的，我来规划" }) satisfies ReplyPayload;
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyResolver,
+      replyOptions: { runId: "run-web-think-1" },
+    });
+
+    expect(personalMemoryMocks.runPersonalMemoryPreHook).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "web-gui",
+        messageText: "请帮我规划下周安排",
       }),
     );
   });
@@ -537,48 +994,5 @@ describe("dispatchReplyFromConfig", () => {
         reason: "duplicate",
       }),
     );
-  });
-
-  it("suppresses isReasoning payloads from final replies (WhatsApp channel)", async () => {
-    setNoAbort();
-    const dispatcher = createDispatcher();
-    const ctx = buildTestCtx({ Provider: "whatsapp" });
-    const replyResolver = async () =>
-      [
-        { text: "Reasoning:\n_thinking..._", isReasoning: true },
-        { text: "The answer is 42" },
-      ] satisfies ReplyPayload[];
-    await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
-    const finalCalls = (dispatcher.sendFinalReply as ReturnType<typeof vi.fn>).mock.calls;
-    expect(finalCalls).toHaveLength(1);
-    expect(finalCalls[0][0]).toMatchObject({ text: "The answer is 42" });
-  });
-
-  it("suppresses isReasoning payloads from block replies (generic dispatch path)", async () => {
-    setNoAbort();
-    const dispatcher = createDispatcher();
-    const ctx = buildTestCtx({ Provider: "whatsapp" });
-    const blockReplySentTexts: string[] = [];
-    const replyResolver = async (
-      _ctx: MsgContext,
-      opts?: GetReplyOptions,
-    ): Promise<ReplyPayload> => {
-      // Simulate block reply with reasoning payload
-      await opts?.onBlockReply?.({ text: "Reasoning:\n_thinking..._", isReasoning: true });
-      await opts?.onBlockReply?.({ text: "The answer is 42" });
-      return { text: "The answer is 42" };
-    };
-    // Capture what actually gets dispatched as block replies
-    (dispatcher.sendBlockReply as ReturnType<typeof vi.fn>).mockImplementation(
-      (payload: ReplyPayload) => {
-        if (payload.text) {
-          blockReplySentTexts.push(payload.text);
-        }
-        return true;
-      },
-    );
-    await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
-    expect(blockReplySentTexts).not.toContain("Reasoning:\n_thinking..._");
-    expect(blockReplySentTexts).toContain("The answer is 42");
   });
 });

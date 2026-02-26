@@ -43,7 +43,6 @@ const METHOD_SCOPE_GROUPS: Record<OperatorScope, readonly string[]> = {
   ],
   [READ_SCOPE]: [
     "health",
-    "doctor.memory.status",
     "logs.tail",
     "channels.status",
     "status",
@@ -111,6 +110,10 @@ const METHOD_SCOPE_GROUPS: Record<OperatorScope, readonly string[]> = {
     "sessions.compact",
     "connect",
     "chat.inject",
+    "memory.applySuggestion",
+    "memory.suggestions.list",
+    "memory.suggestions.apply",
+    "memory.suggestions.dismiss",
     "web.login.start",
     "web.login.wait",
     "set-heartbeats",

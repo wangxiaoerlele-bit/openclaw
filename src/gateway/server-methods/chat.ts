@@ -9,6 +9,16 @@ import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.j
 import type { MsgContext } from "../../auto-reply/templating.js";
 import { createReplyPrefixOptions } from "../../channels/reply-prefix.js";
 import { resolveSessionFilePath } from "../../config/sessions.js";
+import {
+  applyPersonalMemorySuggestion,
+  PersonalMemoryApplySuggestionError,
+} from "../../personal-memory/apply-suggestion.js";
+import {
+  applyQueuedPersonalMemorySuggestion,
+  dismissPersonalMemorySuggestion,
+  listPersonalMemorySuggestions,
+  PersonalMemorySuggestionQueueError,
+} from "../../personal-memory/suggestion-queue.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import {
   stripInlineDirectiveTagsForDisplay,
@@ -669,6 +679,119 @@ export const chatHandlers: GatewayRequestHandlers = {
       runIds: res.aborted ? [runId] : [],
     });
   },
+  "memory.applySuggestion": ({ params, respond, context }) => {
+    const suggestion = params?.suggestion;
+    const dryRun = typeof params?.dryRun === "boolean" ? params.dryRun : false;
+    const defaultPersonalContextDir = path.resolve(process.cwd(), "personal-context");
+    try {
+      const result = applyPersonalMemorySuggestion({
+        suggestion,
+        personalContextDir: defaultPersonalContextDir,
+        dryRun,
+      });
+      context.logGateway.info?.(
+        `personal-memory apply suggestion target=${result.target} dryRun=${String(result.dryRun)} title=${result.title}`,
+      );
+      respond(true, result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof PersonalMemoryApplySuggestionError) {
+        const code =
+          err.code === "WRITE_FAILED" ? ErrorCodes.UNAVAILABLE : ErrorCodes.INVALID_REQUEST;
+        respond(false, undefined, errorShape(code, message));
+        return;
+      }
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, message));
+    }
+  },
+  "memory.suggestions.list": ({ params, respond, context }) => {
+    const status =
+      params?.status === "pending" ||
+      params?.status === "applied" ||
+      params?.status === "dismissed" ||
+      params?.status === "all"
+        ? params.status
+        : "pending";
+    const limit =
+      typeof params?.limit === "number" && Number.isFinite(params.limit)
+        ? Math.max(1, Math.min(200, Math.floor(params.limit)))
+        : 50;
+    const defaultPersonalContextDir = path.resolve(process.cwd(), "personal-context");
+    try {
+      const result = listPersonalMemorySuggestions({
+        personalContextDir: defaultPersonalContextDir,
+        status,
+        limit,
+      });
+      context.logGateway.info?.(
+        `personal-memory suggestions list status=${status} count=${result.items.length}`,
+      );
+      respond(true, result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof PersonalMemorySuggestionQueueError) {
+        respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, message));
+        return;
+      }
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, message));
+    }
+  },
+  "memory.suggestions.apply": ({ params, respond, context }) => {
+    const id = typeof params?.id === "string" ? params.id.trim() : "";
+    const dryRun = typeof params?.dryRun === "boolean" ? params.dryRun : false;
+    if (!id) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "id is required"));
+      return;
+    }
+    const defaultPersonalContextDir = path.resolve(process.cwd(), "personal-context");
+    try {
+      const result = applyQueuedPersonalMemorySuggestion({
+        personalContextDir: defaultPersonalContextDir,
+        id,
+        dryRun,
+      });
+      context.logGateway.info?.(
+        `personal-memory suggestions apply id=${id} dryRun=${String(dryRun)}`,
+      );
+      respond(true, result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof PersonalMemorySuggestionQueueError) {
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, message));
+        return;
+      }
+      if (err instanceof PersonalMemoryApplySuggestionError) {
+        const code =
+          err.code === "WRITE_FAILED" ? ErrorCodes.UNAVAILABLE : ErrorCodes.INVALID_REQUEST;
+        respond(false, undefined, errorShape(code, message));
+        return;
+      }
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, message));
+    }
+  },
+  "memory.suggestions.dismiss": ({ params, respond, context }) => {
+    const id = typeof params?.id === "string" ? params.id.trim() : "";
+    if (!id) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "id is required"));
+      return;
+    }
+    const defaultPersonalContextDir = path.resolve(process.cwd(), "personal-context");
+    try {
+      const item = dismissPersonalMemorySuggestion({
+        personalContextDir: defaultPersonalContextDir,
+        id,
+      });
+      context.logGateway.info?.(`personal-memory suggestions dismiss id=${id}`);
+      respond(true, item);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof PersonalMemorySuggestionQueueError) {
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, message));
+        return;
+      }
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, message));
+    }
+  },
   "chat.send": async ({ params, respond, context, client }) => {
     if (!validateChatSendParams(params)) {
       respond(
@@ -810,7 +933,6 @@ export const chatHandlers: GatewayRequestHandlers = {
       // Only BodyForAgent gets the timestamp — Body stays raw for UI display.
       // See: https://github.com/moltbot/moltbot/issues/3658
       const stampedMessage = injectTimestamp(parsedMessage, timestampOptsFromConfig(cfg));
-
       const ctx: MsgContext = {
         Body: parsedMessage,
         BodyForAgent: stampedMessage,

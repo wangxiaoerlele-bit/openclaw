@@ -8,7 +8,8 @@ import {
 } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
 import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
-import { createFeishuWSClient, createEventDispatcher } from "./client.js";
+import { createFeishuWSClient, createEventDispatcher, createCardActionHandler } from "./client.js";
+import { handleFeishuPersonalMemoryCardAction } from "./memory-suggestion-actions.js";
 import { probeFeishu } from "./probe.js";
 import type { ResolvedFeishuAccount } from "./types.js";
 
@@ -79,6 +80,96 @@ async function fetchBotOpenId(account: ResolvedFeishuAccount): Promise<string | 
   } catch {
     return undefined;
   }
+}
+
+type FeishuCombinedInboundDispatcher = {
+  encryptKey: string;
+  verificationToken: string;
+  invoke: (data: unknown, params?: { needCheck?: boolean }) => Promise<unknown>;
+};
+
+type LarkCardActionHandlerInternals = Lark.CardActionHandler & {
+  requestHandle?: { parse?: (data: unknown) => unknown };
+  cardHandler?: (event: unknown) => Promise<unknown> | unknown;
+};
+
+function isNoEventHandleResult(value: unknown): boolean {
+  return typeof value === "string" && /^no .+ event handle$/i.test(value);
+}
+
+async function invokeCardActionUnsafeForWebSocket(
+  handler: Lark.CardActionHandler,
+  data: unknown,
+): Promise<unknown> {
+  const internals = handler as LarkCardActionHandlerInternals;
+  const parse = internals.requestHandle?.parse;
+  const cardHandler = internals.cardHandler;
+  if (!parse || !cardHandler) {
+    return undefined;
+  }
+  const parsed = parse(data);
+  if (!parsed || typeof parsed !== "object") {
+    return undefined;
+  }
+  const record = parsed as Record<string, unknown>;
+  if (
+    !("open_message_id" in record) &&
+    !("action" in record) &&
+    !("event" in record && typeof record.event === "object")
+  ) {
+    return undefined;
+  }
+  return await cardHandler(parsed);
+}
+
+function createCombinedInboundDispatcher(params: {
+  eventDispatcher: Lark.EventDispatcher;
+  cardActionHandler: Lark.CardActionHandler;
+  directCardActionHandler?: (event: unknown) => Promise<unknown> | unknown;
+  runtime?: RuntimeEnv;
+  accountId: string;
+}): FeishuCombinedInboundDispatcher {
+  const { eventDispatcher, cardActionHandler, directCardActionHandler, runtime, accountId } =
+    params;
+  return {
+    encryptKey: eventDispatcher.encryptKey,
+    verificationToken: eventDispatcher.verificationToken,
+    async invoke(data: unknown, invokeParams?: { needCheck?: boolean }) {
+      const eventResult = await eventDispatcher.invoke(data, invokeParams);
+      if (eventResult !== undefined && !isNoEventHandleResult(eventResult)) {
+        return eventResult;
+      }
+
+      const isWebSocket = invokeParams?.needCheck === false;
+      if (isWebSocket) {
+        try {
+          const unsafe = await invokeCardActionUnsafeForWebSocket(cardActionHandler, data);
+          if (unsafe !== undefined) {
+            return unsafe;
+          }
+          if (directCardActionHandler) {
+            const direct = await directCardActionHandler(data);
+            if (direct !== undefined) {
+              return direct;
+            }
+          }
+        } catch (err) {
+          runtime?.error?.(
+            `feishu[${accountId}]: websocket card action handler error: ${String(err)}`,
+          );
+        }
+        return eventResult;
+      }
+
+      try {
+        const cardResult = await cardActionHandler.invoke(data);
+        return cardResult === undefined ? eventResult : cardResult;
+      } catch (err) {
+        runtime?.error?.(`feishu[${accountId}]: card action handler error: ${String(err)}`);
+        return eventResult;
+      }
+    },
+  };
 }
 
 /**
@@ -170,6 +261,21 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
     throw new Error(`Feishu account "${accountId}" webhook mode requires verificationToken`);
   }
   const eventDispatcher = createEventDispatcher(account);
+  const handleCardAction = (event: unknown) =>
+    handleFeishuPersonalMemoryCardAction({
+      cfg,
+      accountId,
+      event,
+      runtime,
+    });
+  const cardActionHandler = createCardActionHandler(account, handleCardAction);
+  const inboundDispatcher = createCombinedInboundDispatcher({
+    eventDispatcher,
+    cardActionHandler,
+    directCardActionHandler: handleCardAction,
+    runtime,
+    accountId,
+  });
   const chatHistories = new Map<string, HistoryEntry[]>();
 
   registerEventHandlers(eventDispatcher, {
@@ -181,16 +287,16 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
   });
 
   if (connectionMode === "webhook") {
-    return monitorWebhook({ params, accountId, eventDispatcher });
+    return monitorWebhook({ params, accountId, eventDispatcher: inboundDispatcher });
   }
 
-  return monitorWebSocket({ params, accountId, eventDispatcher });
+  return monitorWebSocket({ params, accountId, eventDispatcher: inboundDispatcher });
 }
 
 type ConnectionParams = {
   params: MonitorAccountParams;
   accountId: string;
-  eventDispatcher: Lark.EventDispatcher;
+  eventDispatcher: FeishuCombinedInboundDispatcher;
 };
 
 async function monitorWebSocket({
@@ -228,7 +334,7 @@ async function monitorWebSocket({
     abortSignal?.addEventListener("abort", handleAbort, { once: true });
 
     try {
-      wsClient.start({ eventDispatcher });
+      wsClient.start({ eventDispatcher: eventDispatcher as unknown as Lark.EventDispatcher });
       log(`feishu[${accountId}]: WebSocket client started`);
     } catch (err) {
       cleanup();
@@ -254,7 +360,11 @@ async function monitorWebhook({
   log(`feishu[${accountId}]: starting Webhook server on ${host}:${port}, path ${path}...`);
 
   const server = http.createServer();
-  const webhookHandler = Lark.adaptDefault(path, eventDispatcher, { autoChallenge: true });
+  const webhookHandler = Lark.adaptDefault(
+    path,
+    eventDispatcher as unknown as Lark.EventDispatcher,
+    { autoChallenge: true },
+  );
   server.on("request", (req, res) => {
     res.on("finish", () => {
       recordWebhookStatus(runtime, accountId, path, res.statusCode);

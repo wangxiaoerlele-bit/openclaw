@@ -4,6 +4,7 @@ const resolveFeishuAccountMock = vi.hoisted(() => vi.fn());
 const getFeishuRuntimeMock = vi.hoisted(() => vi.fn());
 const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
 const sendMarkdownCardFeishuMock = vi.hoisted(() => vi.fn());
+const sendCardFeishuMock = vi.hoisted(() => vi.fn());
 const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
 const createReplyDispatcherWithTypingMock = vi.hoisted(() => vi.fn());
@@ -14,6 +15,7 @@ vi.mock("./runtime.js", () => ({ getFeishuRuntime: getFeishuRuntimeMock }));
 vi.mock("./send.js", () => ({
   sendMessageFeishu: sendMessageFeishuMock,
   sendMarkdownCardFeishu: sendMarkdownCardFeishuMock,
+  sendCardFeishu: sendCardFeishuMock,
 }));
 vi.mock("./client.js", () => ({ createFeishuClient: createFeishuClientMock }));
 vi.mock("./targets.js", () => ({ resolveReceiveIdType: resolveReceiveIdTypeMock }));
@@ -112,6 +114,47 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(streamingInstances[0].close).toHaveBeenCalledTimes(1);
     expect(sendMessageFeishuMock).not.toHaveBeenCalled();
     expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+  });
+
+  it("sends a native personal-memory suggestion action card for Feishu channelData payload", async () => {
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: {} as never,
+      chatId: "oc_chat",
+      accountId: "main",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver(
+      {
+        text: "fallback",
+        channelData: {
+          feishu: {
+            personalMemorySuggestionAction: {
+              queueId: "pms_test_001",
+              level: "L2",
+              target: "decision-log",
+              title: "确认方案",
+              reason: "测试",
+              canApply: true,
+            },
+          },
+        },
+      },
+      { kind: "final" },
+    );
+
+    expect(sendCardFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendCardFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "oc_chat",
+        card: expect.objectContaining({
+          elements: expect.any(Array),
+        }),
+      }),
+    );
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
   });
 
   it("drops pure reasoning-formatted text on feishu", async () => {

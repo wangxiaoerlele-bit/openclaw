@@ -218,6 +218,13 @@ export {
 export { resolveGatewayBindUrl } from "../shared/gateway-bind-url.js";
 export type { GatewayBindUrlResult } from "../shared/gateway-bind-url.js";
 export { resolveTailnetHostWithRunner } from "../shared/tailscale-status.js";
+export {
+  applyQueuedPersonalMemorySuggestion,
+  dismissPersonalMemorySuggestion,
+  listPersonalMemorySuggestions,
+  PersonalMemorySuggestionQueueError,
+} from "../personal-memory/suggestion-queue.js";
+export type { PersonalMemorySuggestionQueueItem } from "../personal-memory/suggestion-queue.js";
 export type {
   TailscaleStatusCommandResult,
   TailscaleStatusCommandRunner,

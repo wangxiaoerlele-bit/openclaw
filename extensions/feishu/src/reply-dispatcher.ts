@@ -8,10 +8,14 @@ import {
 } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
+import {
+  buildFeishuPersonalMemorySuggestionActionCard,
+  extractFeishuPersonalMemorySuggestionActionPayload,
+} from "./memory-suggestion-actions.js";
 import type { MentionTarget } from "./mention.js";
 import { buildMentionedCardContent } from "./mention.js";
 import { getFeishuRuntime } from "./runtime.js";
-import { sendMarkdownCardFeishu, sendMessageFeishu } from "./send.js";
+import { sendCardFeishu, sendMarkdownCardFeishu, sendMessageFeishu } from "./send.js";
 import { FeishuStreamingSession } from "./streaming-card.js";
 import { resolveReceiveIdType } from "./targets.js";
 import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } from "./typing.js";
@@ -195,6 +199,31 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         void typingCallbacks.onReplyStart?.();
       },
       deliver: async (payload: ReplyPayload, info) => {
+        const memorySuggestionAction = extractFeishuPersonalMemorySuggestionActionPayload(
+          payload.channelData,
+        );
+        if (memorySuggestionAction) {
+          try {
+            const card = buildFeishuPersonalMemorySuggestionActionCard({
+              payload: memorySuggestionAction,
+              accountId,
+            });
+            await sendCardFeishu({
+              cfg,
+              to: chatId,
+              card,
+              replyToMessageId,
+              accountId,
+            });
+            return;
+          } catch (error) {
+            params.runtime.error?.(
+              `feishu[${account.accountId}] memory suggestion card send failed: ${String(error)}`,
+            );
+            // Fall back to text reply below.
+          }
+        }
+
         const text = sanitizeFeishuOutboundText(payload.text ?? "");
         if (!text.trim()) {
           return;

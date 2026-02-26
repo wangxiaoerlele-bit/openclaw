@@ -3,7 +3,6 @@ import { GATEWAY_EVENT_UPDATE_AVAILABLE } from "./events.js";
 
 const BASE_METHODS = [
   "health",
-  "doctor.memory.status",
   "logs.tail",
   "channels.status",
   "channels.logout",
@@ -94,6 +93,10 @@ const BASE_METHODS = [
   "chat.history",
   "chat.abort",
   "chat.send",
+  "memory.applySuggestion",
+  "memory.suggestions.list",
+  "memory.suggestions.apply",
+  "memory.suggestions.dismiss",
 ];
 
 export function listGatewayMethods(): string[] {

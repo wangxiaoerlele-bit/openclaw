@@ -7,6 +7,8 @@ export type PersonalContextPathErrorCode =
   | "DIR_NOT_FOUND"
   | "DIR_NAME_INVALID"
   | "DIR_OUTSIDE_WORKSPACE"
+  | "WORKSPACE_FILE_NOT_FOUND"
+  | "WORKSPACE_FILE_OUTSIDE_WORKSPACE"
   | "FILE_NAME_EMPTY"
   | "FILE_NAME_ABSOLUTE"
   | "FILE_NAME_PATH_SEPARATOR"
@@ -65,6 +67,25 @@ export function resolvePersonalContextDir(cwd: string, dirArg: string): string {
     throw new PersonalContextPathError(
       "DIR_OUTSIDE_WORKSPACE",
       `memory directory must stay within current workspace: ${real}`,
+    );
+  }
+  return real;
+}
+
+export function resolveWorkspaceReadableFilePath(cwd: string, fileArg: string): string {
+  const cwdReal = fs.realpathSync(cwd);
+  const resolved = path.resolve(cwd, fileArg);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+    throw new PersonalContextPathError(
+      "WORKSPACE_FILE_NOT_FOUND",
+      `source file not found: ${resolved}`,
+    );
+  }
+  const real = fs.realpathSync(resolved);
+  if (!isSubpath(cwdReal, real)) {
+    throw new PersonalContextPathError(
+      "WORKSPACE_FILE_OUTSIDE_WORKSPACE",
+      `source file must stay within current workspace: ${real}`,
     );
   }
   return real;
@@ -218,4 +239,65 @@ export function insertDecisionEntryIntoLog(text: string, entry: string): string 
     return `${text}\n${entry}`;
   }
   return `${text}\n\n${entry}`;
+}
+
+export function renderDecisionEntryMarkdown(entry: DecisionEntry): string {
+  const normalizeInline = (value: string | undefined) => (value ?? "").trim() || "(待补充)";
+  return [
+    `### [${entry.date}] ${entry.title}`,
+    "",
+    `- 背景：${normalizeInline(entry.background)}`,
+    `- 决策：${normalizeInline(entry.decision)}`,
+    `- 原因：${normalizeInline(entry.reason)}`,
+    `- 备选方案（可选）：(待补充)`,
+    `- 影响范围：${normalizeInline(entry.impact)}`,
+    `- 后续动作：${normalizeInline(entry.next)}`,
+    `- 相关文件/链接：${normalizeInline(entry.links)}`,
+    "",
+  ].join("\n");
+}
+
+export function replaceDecisionEntriesInLog(text: string, entries: DecisionEntry[]): string {
+  const sectionMatch = text.match(/## 决策记录\s*([\s\S]*)$/);
+  if (!sectionMatch) {
+    return text;
+  }
+  const sectionIndex = sectionMatch.index ?? 0;
+  const before = text.slice(0, sectionIndex);
+  const rendered = entries
+    .map((entry) => renderDecisionEntryMarkdown(entry).trimEnd())
+    .join("\n\n");
+  const body = rendered
+    ? `## 决策记录\n\n${rendered}\n\n### [YYYY-MM-DD]\n\n- 背景：\n- 决策：\n- 原因：\n- 备选方案（可选）：\n- 影响范围：\n- 后续动作：\n- 相关文件/链接：\n`
+    : `## 决策记录\n\n### [YYYY-MM-DD]\n\n- 背景：\n- 决策：\n- 原因：\n- 备选方案（可选）：\n- 影响范围：\n- 后续动作：\n- 相关文件/链接：\n`;
+  return `${before}${body}`;
+}
+
+export function insertMarkdownBlockUnderSection(params: {
+  text: string;
+  sectionHeading: string;
+  block: string;
+  beforeHeading?: string;
+}): string {
+  const normalizedBlock = params.block.trimEnd();
+  const sectionRe = new RegExp(
+    `(^##\\s+${params.sectionHeading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$)`,
+    "m",
+  );
+  if (sectionRe.test(params.text)) {
+    return params.text.replace(sectionRe, `$1\n\n${normalizedBlock}`);
+  }
+  const newSection = `## ${params.sectionHeading}\n\n${normalizedBlock}\n`;
+  if (params.beforeHeading) {
+    const beforeRe = new RegExp(
+      `(^##\\s+${params.beforeHeading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$)`,
+      "m",
+    );
+    if (beforeRe.test(params.text)) {
+      return params.text.replace(beforeRe, `${newSection}\n$1`);
+    }
+  }
+  return params.text.endsWith("\n")
+    ? `${params.text}\n${newSection}`
+    : `${params.text}\n\n${newSection}`;
 }

@@ -1,6 +1,6 @@
 ---
 name: weather
-description: "Get current weather and forecasts via wttr.in or Open-Meteo. Use when: user asks about weather, temperature, or forecasts for any location. NOT for: historical weather data, severe weather alerts, or detailed meteorological analysis. No API key needed."
+description: "Get current weather and forecasts via wttr.in (primary) or Open-Meteo (fallback). Use when: user asks about weather, temperature, or forecasts for any location. NOT for: historical weather data, severe weather alerts, or detailed meteorological analysis. No API key needed."
 homepage: https://wttr.in/:help
 metadata: { "openclaw": { "emoji": "🌤️", "requires": { "bins": ["curl"] } } }
 ---
@@ -47,7 +47,11 @@ Always include a city, region, or airport code in weather queries.
   - `format=v2d`
   - plain `wttr.in/<city>` (large ANSI output can hang/stream slowly)
 - On macOS, `timeout` may not exist. Use curl's `--max-time` instead.
-- If a weather endpoint is slow/fails, do **one fallback** (for example English city name + `format=3`) and then reply with the best available result. Do not loop on repeated retries.
+- **Fallback Strategy**: If wttr.in times out, immediately try Open-Meteo (requires latitude/longitude):
+  1. First try: `wttr.in/<city>?format=3`
+  2. If timeout (code 28), try Open-Meteo with known coordinates
+  3. If both fail, inform user and suggest manual check
+- Do not loop on repeated retries.
 
 ### Current Weather
 
@@ -124,3 +128,72 @@ curl -sS --connect-timeout 5 --max-time 10 "wttr.in/London?format=v2"
 - Rate limited; don't spam requests
 - Works for most global cities
 - Supports airport codes: `curl wttr.in/ORD`
+
+---
+
+## Open-Meteo API (Fallback)
+
+Use Open-Meteo when wttr.in is unavailable or slow.
+
+### Current Weather
+
+```bash
+# Nanning, China (lat: 22.82, lon: 108.32)
+curl -s --connect-timeout 5 --max-time 10 "https://api.open-meteo.com/v1/forecast?latitude=22.82&longitude=108.32&current_weather=true"
+
+# Parse temperature and weather code
+curl -s "https://api.open-meteo.com/v1/forecast?latitude=22.82&longitude=108.32&current_weather=true" | jq -r '.current_weather | "Temp: \(.temperature)°C, Wind: \(.windspeed) km/h, Code: \(.weathercode)"'
+```
+
+### Weather Code Mapping
+
+| Code   | Description   | Emoji |
+| ------ | ------------- | ----- |
+| 0      | Clear sky     | ☀️    |
+| 1-3    | Partly cloudy | ⛅    |
+| 45, 48 | Fog           | 🌫️    |
+| 51-67  | Drizzle/Rain  | 🌧️    |
+| 71-77  | Snow          | ❄️    |
+| 95-99  | Thunderstorm  | ⛈️    |
+
+### City Coordinates (Common)
+
+| City      | Latitude | Longitude |
+| --------- | -------- | --------- |
+| Nanning   | 22.82    | 108.32    |
+| Shanghai  | 31.23    | 121.47    |
+| Beijing   | 39.90    | 116.41    |
+| Guangzhou | 23.13    | 113.27    |
+| Shenzhen  | 22.55    | 114.06    |
+| London    | 51.51    | -0.13     |
+| New York  | 40.71    | -74.01    |
+
+### Quick Weather (Chat-Ready)
+
+```bash
+# Nanning (one-line, human-readable)
+curl -s "https://api.open-meteo.com/v1/forecast?latitude=22.82&longitude=108.32&current_weather=true" | \
+  jq -r '"南宁: \(.current_weather.temperature)°C, 风速: \(.current_weather.windspeed) km/h"'
+
+# With weather code translation
+curl -s "https://api.open-meteo.com/v1/forecast?latitude=22.82&longitude=108.32&current_weather=true" | \
+  jq -r '"南宁: \(.current_weather.temperature)°C, 天气码: \(.current_weather.weathercode)"'
+```
+
+### Pros vs Cons
+
+**Open-Meteo:**
+
+- ✅ More reliable, fewer timeouts
+- ✅ Free, no rate limiting
+- ✅ Returns JSON, easy to parse
+- ❌ Requires coordinates (no city name lookup)
+- ❌ Less user-friendly output (needs jq for formatting)
+
+**wttr.in:**
+
+- ✅ City name lookup
+- ✅ Pretty output formats
+- ✅ Unicode weather icons
+- ❌ Frequent timeouts in some regions
+- ❌ Rate limited

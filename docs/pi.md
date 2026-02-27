@@ -450,6 +450,9 @@ isFailoverAssistantError(...)         // Should failover
 classifyFailoverReason(errorText)     // "auth" | "rate_limit" | "quota" | "timeout" | ...
 ```
 
+Timeout classification includes `stop reason: abort` and `stop reason: network_error` variants
+(including `Unhandled stop reason: ...`) so transport interruptions fail over consistently.
+
 ### Thinking Level Fallback
 
 If a thinking level is unsupported, it falls back:

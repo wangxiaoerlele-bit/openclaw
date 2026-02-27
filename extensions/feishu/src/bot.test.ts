@@ -202,6 +202,39 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockCreateFeishuClient).not.toHaveBeenCalled();
   });
 
+  it("does not bind DM replies to replyToMessageId", async () => {
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          dmPolicy: "open",
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou-dm-user",
+        },
+      },
+      message: {
+        message_id: "msg-dm-no-native-reply",
+        chat_id: "oc-dm",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "hello" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event });
+
+    expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replyToMessageId: undefined,
+      }),
+    );
+  });
+
   it("reads pairing allow store for non-command DMs when dmPolicy is pairing", async () => {
     mockShouldComputeCommandAuthorized.mockReturnValue(false);
     mockReadAllowFromStore.mockResolvedValue(["ou-attacker"]);

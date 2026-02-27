@@ -1,5 +1,6 @@
 import { isMessagingToolDuplicate } from "../../agents/pi-embedded-helpers.js";
 import type { MessagingToolSend } from "../../agents/pi-embedded-runner.js";
+import { normalizeChatType } from "../../channels/chat-type.js";
 import type { ReplyToMode } from "../../config/types.js";
 import { normalizeTargetForProvider } from "../../infra/outbound/target-normalization.js";
 import { normalizeOptionalAccountId } from "../../routing/account-id.js";
@@ -76,10 +77,15 @@ export function applyReplyThreading(params: {
   payloads: ReplyPayload[];
   replyToMode: ReplyToMode;
   replyToChannel?: OriginatingChannelType;
+  chatType?: string | null;
   currentMessageId?: string;
 }): ReplyPayload[] {
-  const { payloads, replyToMode, replyToChannel, currentMessageId } = params;
-  const applyReplyToMode = createReplyToModeFilterForChannel(replyToMode, replyToChannel);
+  const { payloads, replyToMode, replyToChannel, chatType, currentMessageId } = params;
+  const effectiveReplyToMode: ReplyToMode =
+    normalizeChatType(chatType ?? undefined) === "direct" ? "off" : replyToMode;
+  const applyReplyToMode = createReplyToModeFilterForChannel(effectiveReplyToMode, replyToChannel, {
+    chatType,
+  });
   const implicitReplyToId = currentMessageId?.trim() || undefined;
   return payloads
     .map((payload) =>

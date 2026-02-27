@@ -221,7 +221,7 @@ export function resolveMSTeamsReplyPolicy(params: {
   channelConfig?: MSTeamsChannelConfig;
 }): MSTeamsReplyPolicy {
   if (params.isDirectMessage) {
-    return { requireMention: false, replyStyle: "thread" };
+    return { requireMention: false, replyStyle: "top-level" };
   }
 
   const requireMention =

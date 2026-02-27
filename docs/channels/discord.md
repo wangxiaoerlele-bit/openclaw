@@ -555,7 +555,8 @@ Default slash command settings:
     - `first`
     - `all`
 
-    Note: `off` disables implicit reply threading. Explicit `[[reply_to_*]]` tags are still honored.
+    Note: `off` disables implicit reply threading. Explicit `[[reply_to_*]]` tags are still honored in groups/channels.
+    Direct messages always force native reply threading off and ignore explicit `[[reply_to_*]]` tags.
 
     Message IDs are surfaced in context/history so agents can target specific messages.
 

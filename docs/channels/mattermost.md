@@ -89,6 +89,7 @@ Notes:
 
 - `onchar` still responds to explicit @mentions.
 - `channels.mattermost.requireMention` is honored for legacy configs but `chatmode` is preferred.
+- DM outbound replies are sent as top-level posts (no `root_id` reply binding).
 
 ## Access control (DMs)
 

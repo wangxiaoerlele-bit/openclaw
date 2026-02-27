@@ -410,7 +410,8 @@ curl "https://api.telegram.org/bot<bot_token>/getUpdates"
     - `first`
     - `all`
 
-    Note: `off` disables implicit reply threading. Explicit `[[reply_to_*]]` tags are still honored.
+    Note: `off` disables implicit reply threading. Explicit `[[reply_to_*]]` tags are still honored in groups/topics.
+    Direct messages always force native reply threading off and ignore explicit `[[reply_to_*]]` tags.
 
   </Accordion>
 
@@ -436,7 +437,8 @@ curl "https://api.telegram.org/bot<bot_token>/getUpdates"
 
     DM thread behavior:
 
-    - private chats with `message_thread_id` keep DM routing but use thread-aware session keys/reply targets.
+    - private chats with `message_thread_id` keep DM routing but use thread-aware session keys.
+    - outbound DM replies stay top-level (no native reply binding), even when reply tags are present.
 
   </Accordion>
 

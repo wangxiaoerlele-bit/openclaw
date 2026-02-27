@@ -251,6 +251,7 @@ export function createFollowupRunner(params: {
         payloads: sanitizedPayloads,
         replyToMode,
         replyToChannel,
+        chatType: queued.originatingChatType,
       });
 
       const dedupedPayloads = filterMessagingToolDuplicates({

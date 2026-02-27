@@ -1,7 +1,7 @@
 import { classifyFailoverReason, type FailoverReason } from "./pi-embedded-helpers.js";
 
 const TIMEOUT_HINT_RE =
-  /timeout|timed out|deadline exceeded|context deadline exceeded|stop reason:\s*abort|reason:\s*abort|unhandled stop reason:\s*abort/i;
+  /timeout|timed out|deadline exceeded|context deadline exceeded|stop reason:\s*abort|reason:\s*abort|unhandled stop reason:\s*abort|stop reason:\s*network_error|reason:\s*network_error|unhandled stop reason:\s*network_error/i;
 const ABORT_TIMEOUT_RE = /request was aborted|request aborted/i;
 
 export class FailoverError extends Error {

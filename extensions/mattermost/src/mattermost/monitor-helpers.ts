@@ -1,6 +1,7 @@
 import {
   formatInboundFromLabel as formatInboundFromLabelShared,
   resolveThreadSessionKeys as resolveThreadSessionKeysShared,
+  type ChatType,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk";
 export { createDedupeCache, rawDataToString } from "openclaw/plugin-sdk";
@@ -69,4 +70,11 @@ export function resolveThreadSessionKeys(params: {
     ...params,
     normalizeThreadId: (threadId) => threadId,
   });
+}
+
+export function resolveOutboundReplyToId(
+  kind: ChatType,
+  threadRootId?: string,
+): string | undefined {
+  return kind === "direct" ? undefined : threadRootId;
 }

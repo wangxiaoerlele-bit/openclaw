@@ -464,6 +464,7 @@ Key settings (see `/gateway/configuration` for shared channel patterns):
 - `channels.msteams.mediaAuthAllowHosts`: allowlist for attaching Authorization headers on media retries (defaults to Graph + Bot Framework hosts).
 - `channels.msteams.requireMention`: require @mention in channels/groups (default true).
 - `channels.msteams.replyStyle`: `thread | top-level` (see [Reply Style](#reply-style-threads-vs-posts)).
+- Direct messages always use top-level replies (no native thread reply linkage), regardless of `replyStyle`.
 - `channels.msteams.teams.<teamId>.replyStyle`: per-team override.
 - `channels.msteams.teams.<teamId>.requireMention`: per-team override.
 - `channels.msteams.teams.<teamId>.tools`: default per-team tool policy overrides (`allow`/`deny`/`alsoAllow`) used when a channel override is missing.

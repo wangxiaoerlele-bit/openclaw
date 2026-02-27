@@ -388,8 +388,15 @@ describe("isFailoverErrorMessage", () => {
     }
   });
 
-  it("matches abort stop-reason timeout variants", () => {
-    const samples = ["Unhandled stop reason: abort", "stop reason: abort", "reason: abort"];
+  it("matches stop-reason timeout variants", () => {
+    const samples = [
+      "Unhandled stop reason: abort",
+      "stop reason: abort",
+      "reason: abort",
+      "Unhandled stop reason: network_error",
+      "stop reason: network_error",
+      "reason: network_error",
+    ];
     for (const sample of samples) {
       expect(isTimeoutErrorMessage(sample)).toBe(true);
       expect(classifyFailoverReason(sample)).toBe("timeout");

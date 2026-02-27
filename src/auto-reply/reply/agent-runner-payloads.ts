@@ -30,6 +30,7 @@ export function buildReplyPayloads(params: {
   directlySentBlockKeys?: Set<string>;
   replyToMode: ReplyToMode;
   replyToChannel?: OriginatingChannelType;
+  chatType?: string | null;
   currentMessageId?: string;
   messageProvider?: string;
   messagingToolSentTexts?: string[];
@@ -70,6 +71,7 @@ export function buildReplyPayloads(params: {
     payloads: sanitizedPayloads,
     replyToMode: params.replyToMode,
     replyToChannel: params.replyToChannel,
+    chatType: params.chatType,
     currentMessageId: params.currentMessageId,
   })
     .map(

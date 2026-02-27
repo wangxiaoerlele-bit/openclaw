@@ -39,6 +39,7 @@ import {
 import {
   createDedupeCache,
   formatInboundFromLabel,
+  resolveOutboundReplyToId,
   resolveThreadSessionKeys,
 } from "./monitor-helpers.js";
 import { resolveOncharPrefixes, stripOncharPrefix } from "./monitor-onchar.js";
@@ -529,6 +530,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
 
     const baseSessionKey = route.sessionKey;
     const threadRootId = post.root_id?.trim() || undefined;
+    const outboundReplyToId = resolveOutboundReplyToId(kind, threadRootId);
     const threadKeys = resolveThreadSessionKeys({
       baseSessionKey,
       threadId: threadRootId,
@@ -701,8 +703,8 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       MessageSidFirst: allMessageIds.length > 1 ? allMessageIds[0] : undefined,
       MessageSidLast:
         allMessageIds.length > 1 ? allMessageIds[allMessageIds.length - 1] : undefined,
-      ReplyToId: threadRootId,
-      MessageThreadId: threadRootId,
+      ReplyToId: outboundReplyToId,
+      MessageThreadId: outboundReplyToId,
       Timestamp: typeof post.create_at === "number" ? post.create_at : undefined,
       WasMentioned: kind !== "direct" ? effectiveWasMentioned : undefined,
       CommandAuthorized: commandAuthorized,
@@ -785,7 +787,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
               }
               await sendMessageMattermost(to, chunk, {
                 accountId: account.accountId,
-                replyToId: threadRootId,
+                replyToId: outboundReplyToId,
               });
             }
           } else {
@@ -796,7 +798,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
               await sendMessageMattermost(to, caption, {
                 accountId: account.accountId,
                 mediaUrl,
-                replyToId: threadRootId,
+                replyToId: outboundReplyToId,
               });
             }
           }

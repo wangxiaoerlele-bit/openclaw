@@ -933,7 +933,7 @@ export async function handleFeishuMessage(params: {
       agentId: route.agentId,
       runtime: runtime as RuntimeEnv,
       chatId: ctx.chatId,
-      replyToMessageId: ctx.messageId,
+      replyToMessageId: isGroup ? ctx.messageId : undefined,
       mentionTargets: ctx.mentionTargets,
       accountId: account.accountId,
     });

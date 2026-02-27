@@ -191,7 +191,9 @@ export async function runReplyAgent(params: {
     sessionCtx.AccountId,
     sessionCtx.ChatType,
   );
-  const applyReplyToMode = createReplyToModeFilterForChannel(replyToMode, replyToChannel);
+  const applyReplyToMode = createReplyToModeFilterForChannel(replyToMode, replyToChannel, {
+    chatType: sessionCtx.ChatType,
+  });
   const cfg = followupRun.run.config;
   const blockReplyCoalescing =
     blockStreamingEnabled && opts?.onBlockReply
@@ -522,6 +524,7 @@ export async function runReplyAgent(params: {
       directlySentBlockKeys,
       replyToMode,
       replyToChannel,
+      chatType: sessionCtx.ChatType,
       currentMessageId: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
       messageProvider: followupRun.run.messageProvider,
       messagingToolSentTexts: runResult.messagingToolSentTexts,

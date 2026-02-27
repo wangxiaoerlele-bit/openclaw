@@ -230,6 +230,32 @@ describe("applyReplyThreading auto-threading", () => {
     expect(result[0].replyToId).toBe("42");
     expect(result[0].replyToTag).toBe(true);
   });
+
+  it("forces off-mode behavior for direct chats even when mode is all", () => {
+    const result = applyReplyThreading({
+      payloads: [{ text: "A" }],
+      replyToMode: "all",
+      replyToChannel: "telegram",
+      chatType: "direct",
+      currentMessageId: "42",
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].replyToId).toBeUndefined();
+  });
+
+  it("strips explicit reply tags in direct chats", () => {
+    const result = applyReplyThreading({
+      payloads: [{ text: "[[reply_to_current]]A" }],
+      replyToMode: "off",
+      replyToChannel: "telegram",
+      chatType: "direct",
+      currentMessageId: "42",
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].replyToId).toBeUndefined();
+  });
 });
 
 const baseRun: SubagentRunRecord = {

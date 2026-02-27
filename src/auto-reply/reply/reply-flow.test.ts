@@ -1296,13 +1296,13 @@ describe("resolveReplyToMode", () => {
       { cfg: configuredCfg, channel: "telegram", expected: "all" },
       { cfg: configuredCfg, channel: "discord", expected: "first" },
       { cfg: configuredCfg, channel: "slack", expected: "all" },
-      { cfg: chatTypeCfg, channel: "slack", chatType: "direct", expected: "all" },
+      { cfg: chatTypeCfg, channel: "slack", chatType: "direct", expected: "off" },
       { cfg: chatTypeCfg, channel: "slack", chatType: "group", expected: "first" },
       { cfg: chatTypeCfg, channel: "slack", chatType: "channel", expected: "off" },
       { cfg: chatTypeCfg, channel: "slack", chatType: undefined, expected: "off" },
-      { cfg: topLevelFallbackCfg, channel: "slack", chatType: "direct", expected: "first" },
+      { cfg: topLevelFallbackCfg, channel: "slack", chatType: "direct", expected: "off" },
       { cfg: topLevelFallbackCfg, channel: "slack", chatType: "channel", expected: "first" },
-      { cfg: legacyDmCfg, channel: "slack", chatType: "direct", expected: "all" },
+      { cfg: legacyDmCfg, channel: "slack", chatType: "direct", expected: "off" },
       { cfg: legacyDmCfg, channel: "slack", chatType: "channel", expected: "off" },
     ];
     for (const testCase of cases) {

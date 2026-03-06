@@ -191,4 +191,58 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       expect.objectContaining({ text: "Visible answer" }),
     );
   });
+
+  it("prefers final payload and suppresses non-final visible sends", async () => {
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: {} as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: "intermediate" }, { kind: "block" });
+    await options.deliver({ text: "final answer" }, { kind: "final" });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "final answer" }),
+    );
+  });
+
+  it("suppresses additional final payloads after primary send", async () => {
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: {} as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: "final answer #1" }, { kind: "final" });
+    await options.deliver({ text: "final answer #2" }, { kind: "final" });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "final answer #1" }),
+    );
+  });
+
+  it("falls back to deferred non-final payload when final is missing", async () => {
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: {} as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: "tool summary fallback" }, { kind: "tool" });
+    await options.onIdle();
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "tool summary fallback" }),
+    );
+  });
 });

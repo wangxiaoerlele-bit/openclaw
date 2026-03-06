@@ -379,6 +379,37 @@ export type MemorySearchConfig = {
       deltaMessages?: number;
     };
   };
+  /** Hot/warm/cold memory lifecycle settings (progressively enabled by default). */
+  tiering?: {
+    /** Enable tiered memory behavior and ranking (default: true). */
+    enabled?: boolean;
+    /** Automatically migrate files between tiers based on age/activity windows (default: true). */
+    autoMigrate?: boolean;
+    /** Keep recent notes in hot tier for this many days (default: 7). */
+    hotWindowDays?: number;
+    /** Keep medium-term notes in warm tier for this many days before cold archive (default: 30). */
+    warmWindowDays?: number;
+    /** Upper bound on file moves per sync run (default: 200). */
+    maxMovesPerSync?: number;
+    retrieval?: {
+      /** Score boost applied to hot tier retrievals. */
+      hotBoost?: number;
+      /** Score boost applied to warm tier retrievals. */
+      warmBoost?: number;
+      /** Score boost applied to cold tier retrievals. */
+      coldBoost?: number;
+    };
+    budget?: {
+      /** Enable tier-aware snippet budget compression under pressure (default: true). */
+      enabled?: boolean;
+      /** Total snippet character budget before compression (default: 12000). */
+      maxChars?: number;
+      /** Per-result summary cap for warm tier snippets (default: 320). */
+      warmSummaryChars?: number;
+      /** Per-result snippet cap for cold tier snippets (default: 180). */
+      coldSnippetChars?: number;
+    };
+  };
   /** Query behavior. */
   query?: {
     maxResults?: number;

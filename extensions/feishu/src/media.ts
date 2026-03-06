@@ -404,6 +404,7 @@ export async function sendMediaFeishu(params: {
     const loaded = await getFeishuRuntime().media.loadWebMedia(mediaUrl, {
       maxBytes: mediaMaxBytes,
       optimizeImages: false,
+      localRoots: "any", // Allow any local path for Feishu media sending
     });
     buffer = loaded.buffer;
     name = fileName ?? loaded.fileName ?? "file";

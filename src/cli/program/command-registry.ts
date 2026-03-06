@@ -137,7 +137,7 @@ const coreEntries: CoreCliEntry[] = [
     commands: [
       {
         name: "memory",
-        description: "Search and reindex memory files",
+        description: "Search, audit, health-check, and reindex memory files",
         hasSubcommands: true,
       },
     ],

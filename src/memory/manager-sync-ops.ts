@@ -41,6 +41,7 @@ import {
 } from "./session-files.js";
 import { loadSqliteVecExtension } from "./sqlite-vec.js";
 import { requireNodeSqlite } from "./sqlite.js";
+import { getTierDirectoryPaths, planTierMigration } from "./tiering.js";
 import type { MemorySource, MemorySyncProgressUpdate } from "./types.js";
 
 type MemoryIndexMeta = {
@@ -90,6 +91,7 @@ export abstract class MemoryManagerSyncOps {
   protected abstract readonly agentId: string;
   protected abstract readonly workspaceDir: string;
   protected abstract readonly settings: ResolvedMemorySearchConfig;
+  protected abstract readonly tiering: ResolvedMemorySearchConfig["tiering"];
   protected provider: EmbeddingProvider | null = null;
   protected fallbackFrom?: "openai" | "local" | "gemini" | "voyage" | "mistral";
   protected openAi?: OpenAiEmbeddingClient;
@@ -592,6 +594,112 @@ export abstract class MemoryManagerSyncOps {
     }, ms);
   }
 
+  private async resolveUniqueTierTargetPath(targetPath: string): Promise<string> {
+    try {
+      await fs.access(targetPath, fsSync.constants.F_OK);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return targetPath;
+      }
+      throw err;
+    }
+    const ext = path.extname(targetPath);
+    const base = ext ? targetPath.slice(0, -ext.length) : targetPath;
+    const unique = randomUUID().slice(0, 8);
+    return `${base}__${unique}${ext}`;
+  }
+
+  private async moveFileWithFallback(sourcePath: string, targetPath: string): Promise<void> {
+    try {
+      await fs.rename(sourcePath, targetPath);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EXDEV") {
+        throw err;
+      }
+    }
+    await fs.copyFile(sourcePath, targetPath);
+    await fs.rm(sourcePath, { force: true });
+  }
+
+  private async migrateMemoryFilesAcrossTiers(): Promise<number> {
+    if (!this.sources.has("memory") || !this.tiering.enabled || !this.tiering.autoMigrate) {
+      return 0;
+    }
+    const tierDirs = getTierDirectoryPaths(this.workspaceDir);
+    await Promise.all(
+      Object.values(tierDirs).map(async (dir) => await fs.mkdir(dir, { recursive: true })),
+    );
+
+    const files = await listMemoryFiles(this.workspaceDir);
+    if (files.length === 0) {
+      return 0;
+    }
+    let moved = 0;
+    const nowMs = Date.now();
+    for (const absPath of files) {
+      if (moved >= this.tiering.maxMovesPerSync) {
+        break;
+      }
+      const relPath = path.relative(this.workspaceDir, absPath).replace(/\\/g, "/");
+      const stat = await fs.stat(absPath).catch(() => null);
+      if (!stat) {
+        continue;
+      }
+      const plan = planTierMigration({
+        relPath,
+        mtimeMs: stat.mtimeMs,
+        nowMs,
+        config: this.tiering,
+      });
+      if (!plan) {
+        continue;
+      }
+      const targetPath = path.join(this.workspaceDir, plan.targetRelPath);
+      if (path.resolve(targetPath) === path.resolve(absPath)) {
+        continue;
+      }
+      const finalTarget = await this.resolveUniqueTierTargetPath(targetPath);
+      await fs.mkdir(path.dirname(finalTarget), { recursive: true });
+      await this.moveFileWithFallback(absPath, finalTarget);
+      moved += 1;
+      this.dirty = true;
+    }
+    if (moved > 0) {
+      log.debug("memory tier migration: moved files", {
+        moved,
+        maxMovesPerSync: this.tiering.maxMovesPerSync,
+      });
+    }
+    return moved;
+  }
+
+  private pruneOrphanChunks(): number {
+    const rows = this.db
+      .prepare(
+        "SELECT c.id FROM chunks c LEFT JOIN files f ON f.path = c.path AND f.source = c.source WHERE f.path IS NULL",
+      )
+      .all() as Array<{ id: string }>;
+    if (!rows.length) {
+      return 0;
+    }
+    for (const row of rows) {
+      this.db.prepare("DELETE FROM chunks WHERE id = ?").run(row.id);
+      if (this.fts.enabled && this.fts.available) {
+        try {
+          this.db.prepare(`DELETE FROM ${FTS_TABLE} WHERE id = ?`).run(row.id);
+        } catch {}
+      }
+      if (this.vector.enabled && this.vector.available) {
+        try {
+          this.db.prepare(`DELETE FROM ${VECTOR_TABLE} WHERE id = ?`).run(row.id);
+        } catch {}
+      }
+    }
+    return rows.length;
+  }
+
   private scheduleWatchSync() {
     if (!this.sources.has("memory") || !this.settings.sync.watch) {
       return;
@@ -631,12 +739,6 @@ export abstract class MemoryManagerSyncOps {
     needsFullReindex: boolean;
     progress?: MemorySyncProgressState;
   }) {
-    // FTS-only mode: skip embedding sync (no provider)
-    if (!this.provider) {
-      log.debug("Skipping memory file sync in FTS-only mode (no embedding provider)");
-      return;
-    }
-
     const files = await listMemoryFiles(this.workspaceDir, this.settings.extraPaths);
     const fileEntries = (
       await Promise.all(files.map(async (file) => buildFileEntry(file, this.workspaceDir)))
@@ -701,8 +803,8 @@ export abstract class MemoryManagerSyncOps {
       if (this.fts.enabled && this.fts.available) {
         try {
           this.db
-            .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ? AND model = ?`)
-            .run(stale.path, "memory", this.provider.model);
+            .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ?`)
+            .run(stale.path, "memory");
         } catch {}
       }
     }
@@ -712,12 +814,6 @@ export abstract class MemoryManagerSyncOps {
     needsFullReindex: boolean;
     progress?: MemorySyncProgressState;
   }) {
-    // FTS-only mode: skip embedding sync (no provider)
-    if (!this.provider) {
-      log.debug("Skipping session file sync in FTS-only mode (no embedding provider)");
-      return;
-    }
-
     const files = await listSessionFilesForAgent(this.agentId);
     const activePaths = new Set(files.map((file) => sessionPathForFile(file)));
     const indexAll = params.needsFullReindex || this.sessionsDirtyFiles.size === 0;
@@ -809,7 +905,7 @@ export abstract class MemoryManagerSyncOps {
         try {
           this.db
             .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ? AND model = ?`)
-            .run(stale.path, "sessions", this.provider.model);
+            .run(stale.path, "sessions", this.provider?.model ?? "fts-only");
         } catch {}
       }
     }
@@ -845,6 +941,7 @@ export abstract class MemoryManagerSyncOps {
     force?: boolean;
     progress?: (update: MemorySyncProgressUpdate) => void;
   }) {
+    await this.migrateMemoryFilesAcrossTiers();
     const progress = params?.progress ? this.createSyncProgress(params.progress) : undefined;
     if (progress) {
       progress.report({
@@ -904,6 +1001,10 @@ export abstract class MemoryManagerSyncOps {
         this.sessionsDirty = true;
       } else {
         this.sessionsDirty = false;
+      }
+      const prunedOrphans = this.pruneOrphanChunks();
+      if (prunedOrphans > 0) {
+        log.debug("memory sync: pruned orphan chunks", { chunks: prunedOrphans });
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);

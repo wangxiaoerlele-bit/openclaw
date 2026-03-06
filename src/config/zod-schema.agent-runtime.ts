@@ -665,6 +665,33 @@ export const MemorySearchSchema = z
       })
       .strict()
       .optional(),
+    tiering: z
+      .object({
+        enabled: z.boolean().optional(),
+        autoMigrate: z.boolean().optional(),
+        hotWindowDays: z.number().int().positive().optional(),
+        warmWindowDays: z.number().int().positive().optional(),
+        maxMovesPerSync: z.number().int().positive().optional(),
+        retrieval: z
+          .object({
+            hotBoost: z.number().min(-1).max(1).optional(),
+            warmBoost: z.number().min(-1).max(1).optional(),
+            coldBoost: z.number().min(-1).max(1).optional(),
+          })
+          .strict()
+          .optional(),
+        budget: z
+          .object({
+            enabled: z.boolean().optional(),
+            maxChars: z.number().int().positive().optional(),
+            warmSummaryChars: z.number().int().positive().optional(),
+            coldSnippetChars: z.number().int().positive().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .optional();

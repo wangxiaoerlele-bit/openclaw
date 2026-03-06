@@ -747,6 +747,30 @@ export const FIELD_HELP: Record<string, string> = {
     "Controls how fast older memory loses rank when temporal decay is enabled (half-life in days, default: 30). Lower values prioritize recent context more aggressively.",
   "agents.defaults.memorySearch.cache.enabled":
     "Caches computed chunk embeddings in SQLite so reindexing and incremental updates run faster (default: true). Keep this enabled unless investigating cache correctness or minimizing disk usage.",
+  "agents.defaults.memorySearch.tiering.enabled":
+    "Enables hot/warm/cold memory tier behavior so retrieval prefers recent context while keeping older records searchable.",
+  "agents.defaults.memorySearch.tiering.autoMigrate":
+    "Automatically migrates markdown files across hot/warm/cold folders during memory sync based on recency thresholds.",
+  "agents.defaults.memorySearch.tiering.hotWindowDays":
+    "Maximum age in days for files that remain in hot tier before being eligible for warm migration.",
+  "agents.defaults.memorySearch.tiering.warmWindowDays":
+    "Maximum age in days for files that remain in warm tier before being archived into cold tier.",
+  "agents.defaults.memorySearch.tiering.maxMovesPerSync":
+    "Caps how many file migrations are performed in one sync pass to avoid bursty disk churn on large datasets.",
+  "agents.defaults.memorySearch.tiering.retrieval.hotBoost":
+    "Score boost applied to hot-tier hits during ranking so short-term context is prioritized when scores are close.",
+  "agents.defaults.memorySearch.tiering.retrieval.warmBoost":
+    "Score boost applied to warm-tier hits during ranking (typically lower than hot boost).",
+  "agents.defaults.memorySearch.tiering.retrieval.coldBoost":
+    "Score boost or penalty applied to cold-tier hits during ranking.",
+  "agents.defaults.memorySearch.tiering.budget.enabled":
+    "Enables tier-aware snippet budgeting: keep full hot snippets first, then trim warm/cold snippets under token pressure.",
+  "agents.defaults.memorySearch.tiering.budget.maxChars":
+    "Total character budget for injected memory snippets after tier-aware trimming.",
+  "agents.defaults.memorySearch.tiering.budget.warmSummaryChars":
+    "Per-result maximum snippet length for warm-tier hits when budget trimming is active.",
+  "agents.defaults.memorySearch.tiering.budget.coldSnippetChars":
+    "Per-result maximum snippet length for cold-tier hits when budget trimming is active.",
   memory: "Memory backend configuration (global).",
   "memory.backend":
     'Selects the global memory engine: "builtin" uses OpenClaw memory internals, while "qmd" uses the QMD sidecar pipeline. Keep "builtin" unless you intentionally operate QMD.',

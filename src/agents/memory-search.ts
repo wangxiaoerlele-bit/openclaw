@@ -2,6 +2,11 @@ import os from "node:os";
 import path from "node:path";
 import type { OpenClawConfig, MemorySearchConfig } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
+import {
+  resolveMemoryTieringConfig,
+  type MemoryTieringConfig,
+  type MemoryTieringConfigInput,
+} from "../memory/tiering.js";
 import { clampInt, clampNumber, resolveUserPath } from "../utils.js";
 import { resolveAgentConfig } from "./agent-scope.js";
 
@@ -54,6 +59,7 @@ export type ResolvedMemorySearchConfig = {
       deltaMessages: number;
     };
   };
+  tiering: MemoryTieringConfig;
   query: {
     maxResults: number;
     minScore: number;
@@ -231,6 +237,18 @@ function mergeConfig(
         DEFAULT_SESSION_DELTA_MESSAGES,
     },
   };
+  const tiering = resolveMemoryTieringConfig({
+    ...(defaults?.tiering as MemoryTieringConfigInput | undefined),
+    ...(overrides?.tiering as MemoryTieringConfigInput | undefined),
+    retrieval: {
+      ...(defaults?.tiering as MemoryTieringConfigInput | undefined)?.retrieval,
+      ...(overrides?.tiering as MemoryTieringConfigInput | undefined)?.retrieval,
+    },
+    budget: {
+      ...(defaults?.tiering as MemoryTieringConfigInput | undefined)?.budget,
+      ...(overrides?.tiering as MemoryTieringConfigInput | undefined)?.budget,
+    },
+  });
   const query = {
     maxResults: overrides?.query?.maxResults ?? defaults?.query?.maxResults ?? DEFAULT_MAX_RESULTS,
     minScore: overrides?.query?.minScore ?? defaults?.query?.minScore ?? DEFAULT_MIN_SCORE,
@@ -317,6 +335,7 @@ function mergeConfig(
         deltaMessages,
       },
     },
+    tiering,
     query: {
       ...query,
       minScore,

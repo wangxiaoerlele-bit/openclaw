@@ -89,23 +89,33 @@ export type CreateFeishuReplyDispatcherParams = {
   runtime: RuntimeEnv;
   chatId: string;
   replyToMessageId?: string;
+  typingTargetMessageId?: string;
   mentionTargets?: MentionTarget[];
   accountId?: string;
 };
 
 export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherParams) {
   const core = getFeishuRuntime();
-  const { cfg, agentId, chatId, replyToMessageId, mentionTargets, accountId } = params;
+  const {
+    cfg,
+    agentId,
+    chatId,
+    replyToMessageId,
+    typingTargetMessageId,
+    mentionTargets,
+    accountId,
+  } = params;
   const account = resolveFeishuAccount({ cfg, accountId });
   const prefixContext = createReplyPrefixContext({ cfg, agentId });
+  const typingMessageId = typingTargetMessageId ?? replyToMessageId;
 
   let typingState: TypingIndicatorState | null = null;
   const typingCallbacks = createTypingCallbacks({
     start: async () => {
-      if (!replyToMessageId) {
+      if (!typingMessageId) {
         return;
       }
-      typingState = await addTypingIndicator({ cfg, messageId: replyToMessageId, accountId });
+      typingState = await addTypingIndicator({ cfg, messageId: typingMessageId, accountId });
     },
     stop: async () => {
       if (!typingState) {
@@ -143,6 +153,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let lastPartial = "";
   let partialUpdateQueue: Promise<void> = Promise.resolve();
   let streamingStartPromise: Promise<void> | null = null;
+  let deliveredPrimaryReply = false;
+  let deferredNonFinalPayload: ReplyPayload | null = null;
 
   const startStreaming = () => {
     if (!streamingEnabled || streamingStartPromise || streaming) {
@@ -187,99 +199,127 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     lastPartial = "";
   };
 
+  const deliverPayloadToFeishu = async (
+    payload: ReplyPayload,
+    info: { kind: "tool" | "block" | "final" },
+  ): Promise<boolean> => {
+    const memorySuggestionAction = extractFeishuPersonalMemorySuggestionActionPayload(
+      payload.channelData,
+    );
+    if (memorySuggestionAction) {
+      try {
+        const card = buildFeishuPersonalMemorySuggestionActionCard({
+          payload: memorySuggestionAction,
+          accountId,
+        });
+        await sendCardFeishu({
+          cfg,
+          to: chatId,
+          card,
+          replyToMessageId,
+          accountId,
+        });
+        return true;
+      } catch (error) {
+        params.runtime.error?.(
+          `feishu[${account.accountId}] memory suggestion card send failed: ${String(error)}`,
+        );
+        // Fall back to text reply below.
+      }
+    }
+
+    const text = sanitizeFeishuOutboundText(payload.text ?? "");
+    if (!text.trim()) {
+      return false;
+    }
+
+    const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
+
+    if ((info.kind === "block" || info.kind === "final") && streamingEnabled && useCard) {
+      startStreaming();
+      if (streamingStartPromise) {
+        await streamingStartPromise;
+      }
+    }
+
+    if (streaming?.isActive()) {
+      if (info.kind === "final") {
+        streamText = text;
+        await closeStreaming();
+        return true;
+      }
+      return false;
+    }
+
+    let first = true;
+    if (useCard) {
+      for (const chunk of core.channel.text.chunkTextWithMode(text, textChunkLimit, chunkMode)) {
+        await sendMarkdownCardFeishu({
+          cfg,
+          to: chatId,
+          text: chunk,
+          replyToMessageId,
+          mentions: first ? mentionTargets : undefined,
+          accountId,
+        });
+        first = false;
+      }
+    } else {
+      const converted = core.channel.text.convertMarkdownTables(text, tableMode);
+      for (const chunk of core.channel.text.chunkTextWithMode(
+        converted,
+        textChunkLimit,
+        chunkMode,
+      )) {
+        await sendMessageFeishu({
+          cfg,
+          to: chatId,
+          text: chunk,
+          replyToMessageId,
+          mentions: first ? mentionTargets : undefined,
+          accountId,
+        });
+        first = false;
+      }
+    }
+
+    return true;
+  };
+
   const { dispatcher, replyOptions, markDispatchIdle } =
     core.channel.reply.createReplyDispatcherWithTyping({
       responsePrefix: prefixContext.responsePrefix,
       responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
       humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, agentId),
       onReplyStart: () => {
+        deliveredPrimaryReply = false;
+        deferredNonFinalPayload = null;
         if (streamingEnabled && renderMode === "card") {
           startStreaming();
         }
         void typingCallbacks.onReplyStart?.();
       },
       deliver: async (payload: ReplyPayload, info) => {
-        const memorySuggestionAction = extractFeishuPersonalMemorySuggestionActionPayload(
-          payload.channelData,
-        );
-        if (memorySuggestionAction) {
-          try {
-            const card = buildFeishuPersonalMemorySuggestionActionCard({
-              payload: memorySuggestionAction,
-              accountId,
-            });
-            await sendCardFeishu({
-              cfg,
-              to: chatId,
-              card,
-              replyToMessageId,
-              accountId,
-            });
-            return;
-          } catch (error) {
-            params.runtime.error?.(
-              `feishu[${account.accountId}] memory suggestion card send failed: ${String(error)}`,
-            );
-            // Fall back to text reply below.
-          }
-        }
-
-        const text = sanitizeFeishuOutboundText(payload.text ?? "");
-        if (!text.trim()) {
+        // Feishu users expect a single visible answer per turn. Keep non-final
+        // payloads as fallback only, and prefer the final payload when present.
+        if (info.kind !== "final") {
+          deferredNonFinalPayload = payload;
+          params.runtime.log?.(
+            `feishu[${account.accountId}] deferred ${info.kind} payload (single-reply mode)`,
+          );
           return;
         }
 
-        const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
-
-        if ((info?.kind === "block" || info?.kind === "final") && streamingEnabled && useCard) {
-          startStreaming();
-          if (streamingStartPromise) {
-            await streamingStartPromise;
-          }
-        }
-
-        if (streaming?.isActive()) {
-          if (info?.kind === "final") {
-            streamText = text;
-            await closeStreaming();
-          }
+        if (deliveredPrimaryReply) {
+          params.runtime.log?.(
+            `feishu[${account.accountId}] ignored additional final payload (single-reply mode)`,
+          );
           return;
         }
-
-        let first = true;
-        if (useCard) {
-          for (const chunk of core.channel.text.chunkTextWithMode(
-            text,
-            textChunkLimit,
-            chunkMode,
-          )) {
-            await sendMarkdownCardFeishu({
-              cfg,
-              to: chatId,
-              text: chunk,
-              replyToMessageId,
-              mentions: first ? mentionTargets : undefined,
-              accountId,
-            });
-            first = false;
-          }
-        } else {
-          const converted = core.channel.text.convertMarkdownTables(text, tableMode);
-          for (const chunk of core.channel.text.chunkTextWithMode(
-            converted,
-            textChunkLimit,
-            chunkMode,
-          )) {
-            await sendMessageFeishu({
-              cfg,
-              to: chatId,
-              text: chunk,
-              replyToMessageId,
-              mentions: first ? mentionTargets : undefined,
-              accountId,
-            });
-            first = false;
-          }
+        const didSend = await deliverPayloadToFeishu(payload, info);
+        if (didSend) {
+          deliveredPrimaryReply = true;
+          deferredNonFinalPayload = null;
         }
       },
       onError: async (error, info) => {
@@ -290,6 +330,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         typingCallbacks.onIdle?.();
       },
       onIdle: async () => {
+        if (!deliveredPrimaryReply && deferredNonFinalPayload) {
+          params.runtime.log?.(
+            `feishu[${account.accountId}] sending deferred fallback payload on idle (single-reply mode)`,
+          );
+          const didSend = await deliverPayloadToFeishu(deferredNonFinalPayload, {
+            kind: "final",
+          });
+          if (didSend) {
+            deliveredPrimaryReply = true;
+          }
+          deferredNonFinalPayload = null;
+        }
         await closeStreaming();
         typingCallbacks.onIdle?.();
       },

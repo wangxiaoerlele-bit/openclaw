@@ -8,8 +8,11 @@ import { loadConfig } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
 import { resolveSessionTranscriptsDirForAgent } from "../config/sessions/paths.js";
 import { setVerbose } from "../globals.js";
+import { inspectBuiltinMemoryHealth, repairBuiltinMemoryHealth } from "../memory/health-check.js";
 import { getMemorySearchManager, type MemorySearchManagerResult } from "../memory/index.js";
 import { listMemoryFiles, normalizeExtraMemoryPaths } from "../memory/internal.js";
+import { listSessionFilesForAgent, sessionPathForFile } from "../memory/session-files.js";
+import { requireNodeSqlite } from "../memory/sqlite.js";
 import { defaultRuntime } from "../runtime.js";
 import { formatDocsLink } from "../terminal/links.js";
 import { colorize, isRich, theme } from "../terminal/theme.js";
@@ -25,6 +28,9 @@ type MemoryCommandOptions = {
   index?: boolean;
   force?: boolean;
   verbose?: boolean;
+  strict?: boolean;
+  repair?: boolean;
+  maxFileMb?: number;
 };
 
 type MemoryManager = NonNullable<MemorySearchManagerResult["manager"]>;
@@ -43,6 +49,151 @@ type MemorySourceScan = {
   totalFiles: number | null;
   issues: string[];
 };
+
+type MemorySourceAudit = {
+  source: MemorySourceName;
+  discovered: number;
+  indexed: number;
+  missingInIndex: string[];
+  staleInIndex: string[];
+};
+
+type MemoryAuditResult = {
+  agentId: string;
+  backend: string;
+  workspaceDir?: string;
+  dbPath?: string;
+  sources: MemorySourceAudit[];
+  issues: string[];
+};
+
+function normalizeIndexedPath(value: string): string {
+  return value.replace(/\\/g, "/");
+}
+
+function sortUniquePaths(values: string[]): string[] {
+  const normalized = values.map((value) => normalizeIndexedPath(value).trim()).filter(Boolean);
+  return Array.from(new Set(normalized)).toSorted((a, b) => a.localeCompare(b));
+}
+
+function isMemorySourceName(value: string): value is MemorySourceName {
+  return value === "memory" || value === "sessions";
+}
+
+function diffPaths(
+  discovered: string[],
+  indexed: string[],
+): {
+  missingInIndex: string[];
+  staleInIndex: string[];
+} {
+  const discoveredSet = new Set(discovered);
+  const indexedSet = new Set(indexed);
+  const missingInIndex = discovered.filter((entry) => !indexedSet.has(entry));
+  const staleInIndex = indexed.filter((entry) => !discoveredSet.has(entry));
+  return { missingInIndex, staleInIndex };
+}
+
+async function discoverSourcePaths(params: {
+  workspaceDir: string;
+  agentId: string;
+  sources: MemorySourceName[];
+  extraPaths?: string[];
+}): Promise<{ paths: Map<MemorySourceName, string[]>; issues: string[] }> {
+  const discovered = new Map<MemorySourceName, string[]>();
+  const issues: string[] = [];
+  for (const source of params.sources) {
+    if (source === "memory") {
+      try {
+        const files = await listMemoryFiles(params.workspaceDir, params.extraPaths);
+        discovered.set(
+          source,
+          sortUniquePaths(
+            files.map((absPath) =>
+              normalizeIndexedPath(path.relative(params.workspaceDir, absPath)),
+            ),
+          ),
+        );
+      } catch (err) {
+        const message = formatErrorMessage(err);
+        issues.push(`memory file discovery failed: ${message}`);
+        discovered.set(source, []);
+      }
+      continue;
+    }
+    if (source === "sessions") {
+      try {
+        const files = await listSessionFilesForAgent(params.agentId);
+        discovered.set(source, sortUniquePaths(files.map((file) => sessionPathForFile(file))));
+      } catch (err) {
+        const message = formatErrorMessage(err);
+        issues.push(`session file discovery failed: ${message}`);
+        discovered.set(source, []);
+      }
+      continue;
+    }
+  }
+  return { paths: discovered, issues };
+}
+
+function readIndexedPathsFromBuiltinStore(params: {
+  dbPath?: string;
+  sources: MemorySourceName[];
+}): { paths: Map<MemorySourceName, string[]>; issues: string[] } {
+  const paths = new Map<MemorySourceName, string[]>();
+  const issues: string[] = [];
+  for (const source of params.sources) {
+    paths.set(source, []);
+  }
+  if (!params.dbPath) {
+    issues.push("memory db path unavailable");
+    return { paths, issues };
+  }
+  const dbPath = params.dbPath.trim();
+  if (!dbPath) {
+    issues.push("memory db path unavailable");
+    return { paths, issues };
+  }
+
+  const { DatabaseSync } = requireNodeSqlite();
+  let db: import("node:sqlite").DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const fileTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'files'")
+      .get() as { name?: string } | undefined;
+    if (!fileTable?.name) {
+      issues.push(`files table missing in memory db (${shortenHomePath(dbPath)})`);
+      return { paths, issues };
+    }
+    if (params.sources.length === 0) {
+      return { paths, issues };
+    }
+    const placeholders = params.sources.map(() => "?").join(", ");
+    const rows = db
+      .prepare(`SELECT path, source FROM files WHERE source IN (${placeholders})`)
+      .all(...params.sources) as Array<{ path: string; source: string }>;
+    for (const row of rows) {
+      if (!row || typeof row.path !== "string" || !isMemorySourceName(row.source)) {
+        continue;
+      }
+      const existing = paths.get(row.source) ?? [];
+      existing.push(normalizeIndexedPath(row.path));
+      paths.set(row.source, existing);
+    }
+    for (const source of params.sources) {
+      paths.set(source, sortUniquePaths(paths.get(source) ?? []));
+    }
+  } catch (err) {
+    const message = formatErrorMessage(err);
+    issues.push(`memory db read failed (${shortenHomePath(dbPath)}): ${message}`);
+  } finally {
+    try {
+      db?.close();
+    } catch {}
+  }
+  return { paths, issues };
+}
 
 function formatSourceLabel(source: string, workspaceDir: string, agentId: string): string {
   if (source === "memory") {
@@ -535,15 +686,317 @@ export async function runMemoryStatus(opts: MemoryCommandOptions) {
   }
 }
 
+export async function runMemoryAudit(opts: MemoryCommandOptions): Promise<void> {
+  setVerbose(Boolean(opts.verbose));
+  const cfg = loadConfig();
+  const agentIds = resolveAgentIds(cfg, opts.agent);
+  const allResults: MemoryAuditResult[] = [];
+
+  for (const agentId of agentIds) {
+    await withMemoryManagerForAgent({
+      cfg,
+      agentId,
+      purpose: "status",
+      run: async (manager) => {
+        const status = manager.status();
+        const statusSources = status.sources?.filter(isMemorySourceName) ?? [];
+        const sources: MemorySourceName[] = statusSources.length > 0 ? statusSources : ["memory"];
+        const issues: string[] = [];
+        const sourceAudits: MemorySourceAudit[] = [];
+        const discoveredPaths = new Map<MemorySourceName, string[]>();
+        const indexedPaths = new Map<MemorySourceName, string[]>();
+
+        if (!status.workspaceDir?.trim()) {
+          issues.push("workspace path unavailable");
+        } else {
+          const discovery = await discoverSourcePaths({
+            workspaceDir: status.workspaceDir,
+            agentId,
+            sources,
+            extraPaths: status.extraPaths,
+          });
+          for (const source of sources) {
+            discoveredPaths.set(source, discovery.paths.get(source) ?? []);
+          }
+          issues.push(...discovery.issues);
+        }
+
+        if (status.backend === "builtin") {
+          const indexed = readIndexedPathsFromBuiltinStore({
+            dbPath: status.dbPath,
+            sources,
+          });
+          for (const source of sources) {
+            indexedPaths.set(source, indexed.paths.get(source) ?? []);
+          }
+          issues.push(...indexed.issues);
+        } else {
+          for (const source of sources) {
+            indexedPaths.set(source, []);
+          }
+          issues.push("path-level audit unavailable for qmd backend");
+        }
+
+        for (const source of sources) {
+          const discovered = discoveredPaths.get(source) ?? [];
+          const indexed = indexedPaths.get(source) ?? [];
+          const diff = diffPaths(discovered, indexed);
+          sourceAudits.push({
+            source,
+            discovered: discovered.length,
+            indexed: indexed.length,
+            missingInIndex: diff.missingInIndex,
+            staleInIndex: diff.staleInIndex,
+          });
+        }
+
+        allResults.push({
+          agentId,
+          backend: status.backend,
+          workspaceDir: status.workspaceDir,
+          dbPath: status.dbPath,
+          sources: sourceAudits,
+          issues,
+        });
+      },
+    });
+  }
+
+  if (opts.json) {
+    defaultRuntime.log(JSON.stringify(allResults, null, 2));
+  } else {
+    const rich = isRich();
+    const heading = (text: string) => colorize(rich, theme.heading, text);
+    const muted = (text: string) => colorize(rich, theme.muted, text);
+    const info = (text: string) => colorize(rich, theme.info, text);
+    const success = (text: string) => colorize(rich, theme.success, text);
+    const warn = (text: string) => colorize(rich, theme.warn, text);
+    const label = (text: string) => muted(`${text}:`);
+
+    for (const result of allResults) {
+      const lines = [
+        `${heading("Memory Audit")} ${muted(`(${result.agentId})`)}`,
+        `${label("Backend")} ${info(result.backend)}`,
+        `${label("Workspace")} ${info(shortenHomePath(result.workspaceDir ?? "<unknown>"))}`,
+        `${label("Store")} ${info(shortenHomePath(result.dbPath ?? "<unknown>"))}`,
+      ];
+      for (const source of result.sources) {
+        const hasDiff = source.missingInIndex.length > 0 || source.staleInIndex.length > 0;
+        const countLine = `${source.source}: discovered ${source.discovered} · indexed ${source.indexed} · missing ${source.missingInIndex.length} · stale ${source.staleInIndex.length}`;
+        lines.push(hasDiff ? warn(countLine) : success(countLine));
+        if (source.missingInIndex.length > 0) {
+          lines.push(`  ${warn("missing in index:")}`);
+          for (const entry of source.missingInIndex.slice(0, 20)) {
+            lines.push(`    ${warn(entry)}`);
+          }
+          if (source.missingInIndex.length > 20) {
+            lines.push(`    ${muted(`... ${source.missingInIndex.length - 20} more`)}`);
+          }
+        }
+        if (source.staleInIndex.length > 0) {
+          lines.push(`  ${warn("stale in index:")}`);
+          for (const entry of source.staleInIndex.slice(0, 20)) {
+            lines.push(`    ${warn(entry)}`);
+          }
+          if (source.staleInIndex.length > 20) {
+            lines.push(`    ${muted(`... ${source.staleInIndex.length - 20} more`)}`);
+          }
+        }
+      }
+      if (result.issues.length > 0) {
+        lines.push(label("Issues"));
+        for (const issue of result.issues) {
+          lines.push(`  ${warn(issue)}`);
+        }
+      }
+      defaultRuntime.log(lines.join("\n"));
+      defaultRuntime.log("");
+    }
+  }
+
+  if (opts.strict) {
+    const hasProblems = allResults.some(
+      (result) =>
+        result.issues.length > 0 ||
+        result.sources.some(
+          (source) => source.missingInIndex.length > 0 || source.staleInIndex.length > 0,
+        ),
+    );
+    if (hasProblems) {
+      process.exitCode = 1;
+    }
+  }
+}
+
+export async function runMemoryHealth(opts: MemoryCommandOptions): Promise<void> {
+  setVerbose(Boolean(opts.verbose));
+  const cfg = loadConfig();
+  const agentIds = resolveAgentIds(cfg, opts.agent);
+  const requestedMaxFileMb = typeof opts.maxFileMb === "number" ? opts.maxFileMb : 2;
+  const maxFileBytes = Math.max(1, Math.floor(requestedMaxFileMb * 1024 * 1024));
+
+  const allResults: Array<{
+    agentId: string;
+    backend: string;
+    workspaceDir?: string;
+    dbPath?: string;
+    snapshot?: Awaited<ReturnType<typeof inspectBuiltinMemoryHealth>>;
+    repair?: ReturnType<typeof repairBuiltinMemoryHealth>;
+    issues: string[];
+  }> = [];
+
+  for (const agentId of agentIds) {
+    await withMemoryManagerForAgent({
+      cfg,
+      agentId,
+      purpose: "status",
+      run: async (manager) => {
+        const status = manager.status();
+        const sources = status.sources?.filter(isMemorySourceName) ?? ["memory"];
+        const issues: string[] = [];
+        let snapshot: Awaited<ReturnType<typeof inspectBuiltinMemoryHealth>> | undefined;
+        let repair: ReturnType<typeof repairBuiltinMemoryHealth> | undefined;
+
+        if (status.backend !== "builtin") {
+          issues.push("health check currently supports builtin backend only");
+        } else if (!status.workspaceDir?.trim() || !status.dbPath?.trim()) {
+          issues.push("workspace or db path unavailable");
+        } else {
+          snapshot = await inspectBuiltinMemoryHealth({
+            workspaceDir: status.workspaceDir,
+            dbPath: status.dbPath,
+            agentId,
+            sources,
+            extraPaths: status.extraPaths,
+            maxFileBytes,
+          });
+          if (opts.repair) {
+            const discovered = await discoverSourcePaths({
+              workspaceDir: status.workspaceDir,
+              agentId,
+              sources,
+              extraPaths: status.extraPaths,
+            });
+            issues.push(...discovered.issues);
+            repair = repairBuiltinMemoryHealth({
+              dbPath: status.dbPath,
+              discoveredPathsBySource: discovered.paths,
+            });
+            if (manager.sync) {
+              await manager.sync({ reason: "cli", force: true });
+            }
+            snapshot = await inspectBuiltinMemoryHealth({
+              workspaceDir: status.workspaceDir,
+              dbPath: status.dbPath,
+              agentId,
+              sources,
+              extraPaths: status.extraPaths,
+              maxFileBytes,
+            });
+          }
+        }
+        allResults.push({
+          agentId,
+          backend: status.backend,
+          workspaceDir: status.workspaceDir,
+          dbPath: status.dbPath,
+          snapshot,
+          repair,
+          issues,
+        });
+      },
+    });
+  }
+
+  if (opts.json) {
+    defaultRuntime.log(JSON.stringify(allResults, null, 2));
+  } else {
+    const rich = isRich();
+    const heading = (text: string) => colorize(rich, theme.heading, text);
+    const muted = (text: string) => colorize(rich, theme.muted, text);
+    const info = (text: string) => colorize(rich, theme.info, text);
+    const success = (text: string) => colorize(rich, theme.success, text);
+    const warn = (text: string) => colorize(rich, theme.warn, text);
+    const label = (text: string) => muted(`${text}:`);
+
+    for (const result of allResults) {
+      const lines = [
+        `${heading("Memory Health")} ${muted(`(${result.agentId})`)}`,
+        `${label("Backend")} ${info(result.backend)}`,
+        `${label("Workspace")} ${info(shortenHomePath(result.workspaceDir ?? "<unknown>"))}`,
+        `${label("Store")} ${info(shortenHomePath(result.dbPath ?? "<unknown>"))}`,
+      ];
+      if (result.snapshot) {
+        const counts = result.snapshot.counts;
+        const healthy =
+          counts.missingInIndex === 0 &&
+          counts.staleInIndex === 0 &&
+          counts.orphanChunks === 0 &&
+          counts.duplicateChunkGroups === 0 &&
+          counts.largeFiles === 0;
+        lines.push(
+          healthy
+            ? success("status: healthy")
+            : warn(
+                `status: issues (missing ${counts.missingInIndex}, stale ${counts.staleInIndex}, orphan ${counts.orphanChunks}, duplicate ${counts.duplicateChunkGroups}, large ${counts.largeFiles})`,
+              ),
+        );
+        if (result.snapshot.suggestions.length > 0) {
+          lines.push(label("Suggestions"));
+          for (const item of result.snapshot.suggestions) {
+            lines.push(`  ${warn(item)}`);
+          }
+        }
+      }
+      if (result.repair) {
+        lines.push(
+          `${label("Repair")} ${success(
+            `removed orphan ${result.repair.removedOrphanChunks}, duplicate ${result.repair.removedDuplicateChunks}, stale files ${result.repair.removedStaleFiles}`,
+          )}`,
+        );
+      }
+      if (result.issues.length > 0) {
+        lines.push(label("Issues"));
+        for (const issue of result.issues) {
+          lines.push(`  ${warn(issue)}`);
+        }
+      }
+      defaultRuntime.log(lines.join("\n"));
+      defaultRuntime.log("");
+    }
+  }
+
+  if (opts.strict) {
+    const hasIssues = allResults.some((result) => {
+      if (result.issues.length > 0 || !result.snapshot) {
+        return true;
+      }
+      const counts = result.snapshot.counts;
+      return (
+        counts.missingInIndex > 0 ||
+        counts.staleInIndex > 0 ||
+        counts.orphanChunks > 0 ||
+        counts.duplicateChunkGroups > 0 ||
+        counts.largeFiles > 0
+      );
+    });
+    if (hasIssues) {
+      process.exitCode = 1;
+    }
+  }
+}
+
 export function registerMemoryCli(program: Command) {
   const memory = program
     .command("memory")
-    .description("Search, inspect, and reindex memory files")
+    .description("Search, inspect, audit, and reindex memory files")
     .addHelpText(
       "after",
       () =>
         `\n${theme.heading("Examples:")}\n${formatHelpExamples([
           ["openclaw memory status", "Show index and provider status."],
+          ["openclaw memory audit --strict", "Audit discovered files versus indexed files."],
+          ["openclaw memory health --repair --strict", "Run health checks and apply repairs."],
           ["openclaw memory index --force", "Force a full reindex."],
           ['openclaw memory search --query "deployment notes"', "Search indexed memory entries."],
           ["openclaw memory status --json", "Output machine-readable JSON."],
@@ -560,6 +1013,30 @@ export function registerMemoryCli(program: Command) {
     .option("--verbose", "Verbose logging", false)
     .action(async (opts: MemoryCommandOptions & { force?: boolean }) => {
       await runMemoryStatus(opts);
+    });
+
+  memory
+    .command("audit")
+    .description("Compare discovered memory files with indexed files")
+    .option("--agent <id>", "Agent id (default: all configured agents)")
+    .option("--json", "Print JSON")
+    .option("--strict", "Exit with code 1 when mismatches or issues are found", false)
+    .option("--verbose", "Verbose logging", false)
+    .action(async (opts: MemoryCommandOptions) => {
+      await runMemoryAudit(opts);
+    });
+
+  memory
+    .command("health")
+    .description("Run memory health checks (missing index, orphan chunks, large files)")
+    .option("--agent <id>", "Agent id (default: all configured agents)")
+    .option("--json", "Print JSON")
+    .option("--repair", "Apply health repairs and force reindex", false)
+    .option("--max-file-mb <n>", "Large file threshold in MB", (value: string) => Number(value))
+    .option("--strict", "Exit with code 1 when health issues are found", false)
+    .option("--verbose", "Verbose logging", false)
+    .action(async (opts: MemoryCommandOptions) => {
+      await runMemoryHealth(opts);
     });
 
   memory

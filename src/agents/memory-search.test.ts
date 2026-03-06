@@ -253,4 +253,40 @@ describe("memory search config", () => {
     const resolved = resolveMemorySearchConfig(cfg, "main");
     expect(resolved?.sources).toContain("sessions");
   });
+
+  it("applies tiering defaults and merges overrides", () => {
+    const cfg = asConfig({
+      agents: {
+        defaults: {
+          memorySearch: {
+            tiering: {
+              hotWindowDays: 10,
+              budget: {
+                maxChars: 8000,
+              },
+            },
+          },
+        },
+        list: [
+          {
+            id: "main",
+            default: true,
+            memorySearch: {
+              tiering: {
+                warmWindowDays: 45,
+                retrieval: {
+                  hotBoost: 0.12,
+                },
+              },
+            },
+          },
+        ],
+      },
+    });
+    const resolved = resolveMemorySearchConfig(cfg, "main");
+    expect(resolved?.tiering.hotWindowDays).toBe(10);
+    expect(resolved?.tiering.warmWindowDays).toBe(45);
+    expect(resolved?.tiering.retrieval.hotBoost).toBe(0.12);
+    expect(resolved?.tiering.budget.maxChars).toBe(8000);
+  });
 });

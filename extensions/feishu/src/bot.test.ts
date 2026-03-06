@@ -202,7 +202,7 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockCreateFeishuClient).not.toHaveBeenCalled();
   });
 
-  it("does not bind DM replies to replyToMessageId", async () => {
+  it("keeps DM reply threading off while still passing typing target message id", async () => {
     const cfg: ClawdbotConfig = {
       channels: {
         feishu: {
@@ -231,6 +231,7 @@ describe("handleFeishuMessage command authorization", () => {
     expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
       expect.objectContaining({
         replyToMessageId: undefined,
+        typingTargetMessageId: "msg-dm-no-native-reply",
       }),
     );
   });

@@ -94,6 +94,37 @@ describe("memory cli", () => {
     }
   }
 
+  async function withBuiltinIndexDb(
+    rows: Array<{ path: string; source?: string }>,
+    run: (dbPath: string) => Promise<void>,
+  ) {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-cli-builtin-index-"));
+    const dbPath = path.join(tmpDir, "index.sqlite");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS files (
+          path TEXT PRIMARY KEY,
+          source TEXT NOT NULL DEFAULT 'memory',
+          hash TEXT NOT NULL,
+          mtime INTEGER NOT NULL,
+          size INTEGER NOT NULL
+        );
+      `);
+      const insert = db.prepare(
+        "INSERT INTO files (path, source, hash, mtime, size) VALUES (?, ?, ?, ?, ?)",
+      );
+      for (const row of rows) {
+        insert.run(row.path, row.source ?? "memory", `hash-${row.path}`, Date.now(), 1);
+      }
+      await run(dbPath);
+    } finally {
+      db.close();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  }
+
   async function expectCloseFailureAfterCommand(params: {
     args: string[];
     manager: Record<string, unknown>;
@@ -278,6 +309,81 @@ describe("memory cli", () => {
       expect(close).toHaveBeenCalled();
       expect(process.exitCode).toBe(1);
     });
+  });
+
+  it("reports discovered/indexed diffs in memory audit json output", async () => {
+    const close = vi.fn(async () => {});
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-cli-audit-workspace-"));
+    await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), "root memory");
+    await fs.writeFile(path.join(workspaceDir, "memory", "todo.md"), "todo");
+
+    try {
+      await withBuiltinIndexDb(
+        [
+          { path: "MEMORY.md", source: "memory" },
+          { path: "memory/stale.md", source: "memory" },
+        ],
+        async (dbPath) => {
+          mockManager({
+            status: () =>
+              makeMemoryStatus({
+                backend: "builtin",
+                workspaceDir,
+                dbPath,
+                sources: ["memory"],
+              }),
+            close,
+          });
+
+          const log = spyRuntimeLogs();
+          await runMemoryCli(["audit", "--json"]);
+
+          const payload = firstLoggedJson(log);
+          expect(Array.isArray(payload)).toBe(true);
+          const first = payload[0] as Record<string, unknown>;
+          const sources = first.sources as Array<Record<string, unknown>>;
+          const memory = sources.find((entry) => entry.source === "memory");
+          expect(memory).toBeDefined();
+          expect(memory?.missingInIndex).toContain("memory/todo.md");
+          expect(memory?.staleInIndex).toContain("memory/stale.md");
+          expect(close).toHaveBeenCalled();
+          expect(process.exitCode).toBeUndefined();
+        },
+      );
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("sets exit code when audit --strict finds mismatches", async () => {
+    const close = vi.fn(async () => {});
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-cli-audit-strict-"));
+    await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "memory", "todo.md"), "todo");
+
+    try {
+      await withBuiltinIndexDb([], async (dbPath) => {
+        mockManager({
+          status: () =>
+            makeMemoryStatus({
+              backend: "builtin",
+              workspaceDir,
+              dbPath,
+              sources: ["memory"],
+            }),
+          close,
+        });
+
+        spyRuntimeLogs();
+        await runMemoryCli(["audit", "--strict"]);
+
+        expect(close).toHaveBeenCalled();
+        expect(process.exitCode).toBe(1);
+      });
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
   });
 
   it("logs close failures without failing the command", async () => {

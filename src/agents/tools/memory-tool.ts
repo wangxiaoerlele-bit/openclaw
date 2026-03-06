@@ -3,6 +3,7 @@ import type { OpenClawConfig } from "../../config/config.js";
 import type { MemoryCitationsMode } from "../../config/types.memory.js";
 import { resolveMemoryBackendConfig } from "../../memory/backend-config.js";
 import { getMemorySearchManager } from "../../memory/index.js";
+import { applyTieredSnippetBudget } from "../../memory/tiering.js";
 import type { MemorySearchResult } from "../../memory/types.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { resolveSessionAgentId } from "../agent-scope.js";
@@ -69,6 +70,7 @@ export function createMemorySearchTool(options: {
           mode: citationsMode,
           sessionKey: options.agentSessionKey,
         });
+        const memoryCfg = resolveMemorySearchConfig(cfg, agentId);
         const rawResults = await manager.search(query, {
           maxResults,
           minScore,
@@ -76,11 +78,14 @@ export function createMemorySearchTool(options: {
         });
         const status = manager.status();
         const decorated = decorateCitations(rawResults, includeCitations);
+        const tierBudgeted = memoryCfg
+          ? applyTieredSnippetBudget(decorated, memoryCfg.tiering)
+          : decorated;
         const resolved = resolveMemoryBackendConfig({ cfg, agentId });
         const results =
           status.backend === "qmd"
-            ? clampResultsByInjectedChars(decorated, resolved.qmd?.limits.maxInjectedChars)
-            : decorated;
+            ? clampResultsByInjectedChars(tierBudgeted, resolved.qmd?.limits.maxInjectedChars)
+            : tierBudgeted;
         const searchMode = (status.custom as { searchMode?: string } | undefined)?.searchMode;
         return jsonResult({
           results,

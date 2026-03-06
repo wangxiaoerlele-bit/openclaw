@@ -22,6 +22,7 @@ import { isMemoryPath, normalizeExtraMemoryPaths } from "./internal.js";
 import { MemoryManagerEmbeddingOps } from "./manager-embedding-ops.js";
 import { searchKeyword, searchVector } from "./manager-search.js";
 import { extractKeywords } from "./query-expansion.js";
+import { resolveMemoryTierFromPath, resolveMemoryTierRank, scoreWithTierBoost } from "./tiering.js";
 import type {
   MemoryEmbeddingProbeResult,
   MemoryProviderStatus,
@@ -46,6 +47,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   protected readonly agentId: string;
   protected readonly workspaceDir: string;
   protected readonly settings: ResolvedMemorySearchConfig;
+  protected readonly tiering: ResolvedMemorySearchConfig["tiering"];
   protected provider: EmbeddingProvider | null;
   private readonly requestedProvider: "openai" | "local" | "gemini" | "voyage" | "mistral" | "auto";
   protected fallbackFrom?: "openai" | "local" | "gemini" | "voyage" | "mistral";
@@ -153,6 +155,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     this.agentId = params.agentId;
     this.workspaceDir = params.workspaceDir;
     this.settings = params.settings;
+    this.tiering = params.settings.tiering;
     this.provider = params.providerResult.provider;
     this.requestedProvider = params.providerResult.requestedProvider;
     this.fallbackFrom = params.providerResult.fallbackFrom;
@@ -258,12 +261,10 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         }
       }
 
-      const merged = [...seenIds.values()]
-        .toSorted((a, b) => b.score - a.score)
-        .filter((entry) => entry.score >= minScore)
-        .slice(0, maxResults);
-
-      return merged;
+      return this.applyTierAwareRanking([...seenIds.values()], {
+        minScore,
+        maxResults,
+      });
     }
 
     const keywordResults = hybrid.enabled
@@ -277,7 +278,10 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       : [];
 
     if (!hybrid.enabled) {
-      return vectorResults.filter((entry) => entry.score >= minScore).slice(0, maxResults);
+      return this.applyTierAwareRanking(vectorResults, {
+        minScore,
+        maxResults,
+      });
     }
 
     const merged = await this.mergeHybridResults({
@@ -289,7 +293,32 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       temporalDecay: hybrid.temporalDecay,
     });
 
-    return merged.filter((entry) => entry.score >= minScore).slice(0, maxResults);
+    return this.applyTierAwareRanking(merged, { minScore, maxResults });
+  }
+
+  private applyTierAwareRanking(
+    results: MemorySearchResult[],
+    params: { minScore: number; maxResults: number },
+  ): MemorySearchResult[] {
+    if (results.length === 0) {
+      return [];
+    }
+    const boosted = results.map((entry) => ({
+      ...entry,
+      score: scoreWithTierBoost(entry.score, entry.path, this.tiering),
+    }));
+    const ranked = boosted.toSorted((a, b) => {
+      if (a.score !== b.score) {
+        return b.score - a.score;
+      }
+      const tierA = resolveMemoryTierRank(resolveMemoryTierFromPath(a.path));
+      const tierB = resolveMemoryTierRank(resolveMemoryTierFromPath(b.path));
+      if (tierA !== tierB) {
+        return tierB - tierA;
+      }
+      return a.path.localeCompare(b.path);
+    });
+    return ranked.filter((entry) => entry.score >= params.minScore).slice(0, params.maxResults);
   }
 
   private async searchVector(
@@ -510,6 +539,34 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       }
       return sources.map((source) => Object.assign({ source }, bySource.get(source)!));
     })();
+    const tierCounts = (() => {
+      const row = this.db
+        .prepare(
+          `SELECT\n` +
+            `  SUM(CASE WHEN source = 'memory' AND path LIKE 'memory/hot/%' THEN 1 ELSE 0 END) AS hot,\n` +
+            `  SUM(CASE WHEN source = 'memory' AND path LIKE 'memory/warm/%' THEN 1 ELSE 0 END) AS warm,\n` +
+            `  SUM(CASE WHEN source = 'memory' AND path LIKE 'memory/cold/%' THEN 1 ELSE 0 END) AS cold,\n` +
+            `  SUM(CASE\n` +
+            `    WHEN source = 'memory' AND path LIKE 'memory/%' AND path NOT LIKE 'memory/hot/%'\n` +
+            `      AND path NOT LIKE 'memory/warm/%' AND path NOT LIKE 'memory/cold/%'\n` +
+            `    THEN 1 ELSE 0 END) AS legacy\n` +
+            ` FROM files`,
+        )
+        .get() as
+        | {
+            hot: number | null;
+            warm: number | null;
+            cold: number | null;
+            legacy: number | null;
+          }
+        | undefined;
+      return {
+        hot: row?.hot ?? 0,
+        warm: row?.warm ?? 0,
+        cold: row?.cold ?? 0,
+        legacy: row?.legacy ?? 0,
+      };
+    })();
 
     // Determine search mode: "fts-only" if no provider, "hybrid" otherwise
     const searchMode = this.provider ? "hybrid" : "fts-only";
@@ -571,6 +628,13 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       custom: {
         searchMode,
         providerUnavailableReason: this.providerUnavailableReason,
+        tiering: {
+          enabled: this.tiering.enabled,
+          autoMigrate: this.tiering.autoMigrate,
+          hotWindowDays: this.tiering.hotWindowDays,
+          warmWindowDays: this.tiering.warmWindowDays,
+          files: tierCounts,
+        },
       },
     };
   }

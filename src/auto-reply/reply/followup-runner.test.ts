@@ -97,6 +97,10 @@ function mockCompactionRun(params: {
   );
 }
 
+function createAsyncReplySpy() {
+  return vi.fn(async () => {});
+}
+
 describe("createFollowupRunner compaction", () => {
   it("adds verbose auto-compaction notice and tracks count", async () => {
     const storePath = path.join(
@@ -385,6 +389,78 @@ describe("createFollowupRunner messaging tool dedupe", () => {
       }),
     );
     expect(onBlockReply).not.toHaveBeenCalled();
+  });
+});
+
+describe("createFollowupRunner typing cleanup", () => {
+  async function runTypingCase(agentResult: Record<string, unknown>) {
+    const typing = createMockTypingController();
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      meta: {},
+      ...agentResult,
+    });
+
+    const runner = createFollowupRunner({
+      opts: { onBlockReply: createAsyncReplySpy() },
+      typing,
+      typingMode: "instant",
+      defaultModel: "anthropic/claude-opus-4-5",
+    });
+
+    await runner(baseQueuedRun());
+    return typing;
+  }
+
+  function expectTypingCleanup(typing: ReturnType<typeof createMockTypingController>) {
+    expect(typing.markRunComplete).toHaveBeenCalled();
+    expect(typing.markDispatchIdle).toHaveBeenCalled();
+  }
+
+  it("calls both markRunComplete and markDispatchIdle on NO_REPLY", async () => {
+    const typing = await runTypingCase({ payloads: [{ text: "NO_REPLY" }] });
+    expectTypingCleanup(typing);
+  });
+
+  it("calls both markRunComplete and markDispatchIdle on empty payloads", async () => {
+    const typing = await runTypingCase({ payloads: [] });
+    expectTypingCleanup(typing);
+  });
+
+  it("calls both markRunComplete and markDispatchIdle on agent error", async () => {
+    const typing = createMockTypingController();
+    runEmbeddedPiAgentMock.mockRejectedValueOnce(new Error("agent exploded"));
+
+    const runner = createFollowupRunner({
+      opts: { onBlockReply: vi.fn(async () => {}) },
+      typing,
+      typingMode: "instant",
+      defaultModel: "anthropic/claude-opus-4-5",
+    });
+
+    await runner(baseQueuedRun());
+
+    expectTypingCleanup(typing);
+  });
+
+  it("calls both markRunComplete and markDispatchIdle on successful delivery", async () => {
+    const typing = createMockTypingController();
+    const onBlockReply = vi.fn(async () => {});
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "hello world!" }],
+      meta: {},
+    });
+
+    const runner = createFollowupRunner({
+      opts: { onBlockReply },
+      typing,
+      typingMode: "instant",
+      defaultModel: "anthropic/claude-opus-4-5",
+    });
+
+    await runner(baseQueuedRun());
+
+    expect(onBlockReply).toHaveBeenCalled();
+    expectTypingCleanup(typing);
   });
 });
 

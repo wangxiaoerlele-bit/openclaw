@@ -301,7 +301,12 @@ export function createFollowupRunner(params: {
 
       await sendFollowupPayloads(finalPayloads, queued);
     } finally {
+      // Both signals are required for the typing controller to clean up.
+      // The main inbound dispatch path calls markDispatchIdle() from the
+      // buffered dispatcher's finally block, but followup turns bypass the
+      // dispatcher entirely — so we must fire both signals here.
       typing.markRunComplete();
+      typing.markDispatchIdle();
     }
   };
 }

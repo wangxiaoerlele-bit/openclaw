@@ -60,7 +60,7 @@ function setStoredWhatsAppAllowFrom(allowFrom: string[]) {
 
 async function resolveForAgent(params: {
   cfg: OpenClawConfig;
-  target?: { channel?: "last" | "telegram"; to?: string };
+  target?: { channel?: "last" | "telegram" | "whatsapp" | "feishu"; to?: string };
 }) {
   const channel = params.target ? params.target.channel : DEFAULT_TARGET.channel;
   const to = params.target && "to" in params.target ? params.target.to : DEFAULT_TARGET.to;
@@ -71,6 +71,76 @@ async function resolveForAgent(params: {
 }
 
 describe("resolveDeliveryTarget", () => {
+  it("uses matching session history account for explicit target before binding fallback", async () => {
+    vi.mocked(loadSessionStore).mockReturnValue({
+      "agent:test:main": {
+        sessionId: "main-session",
+        updatedAt: 1000,
+        lastTo: "123456",
+      },
+      "agent:test:telegram:direct:123456": {
+        sessionId: "telegram-session",
+        updatedAt: 2000,
+        lastChannel: "telegram",
+        lastTo: "123456",
+        lastAccountId: "session-account",
+      },
+    } as SessionStore);
+
+    const cfg = makeCfg({
+      bindings: [
+        {
+          agentId: "agent-b",
+          match: { channel: "telegram", accountId: "binding-account" },
+        },
+      ],
+    });
+
+    const result = await resolveForAgent({
+      cfg,
+      target: { channel: "telegram", to: "123456" },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.accountId).toBe("session-account");
+  });
+
+  it("matches explicit targets and session targets after prefix normalization", async () => {
+    vi.mocked(loadSessionStore).mockReturnValue({
+      "agent:test:main": {
+        sessionId: "main-session",
+        updatedAt: 1000,
+        lastTo: "123456",
+      },
+      "agent:test:telegram:direct:123456": {
+        sessionId: "telegram-session",
+        updatedAt: 2000,
+        deliveryContext: {
+          channel: "telegram",
+          to: "telegram:user:123456",
+          accountId: "session-account",
+        },
+      },
+    } as SessionStore);
+
+    const cfg = makeCfg({
+      bindings: [
+        {
+          agentId: "agent-b",
+          match: { channel: "telegram", accountId: "binding-account" },
+        },
+      ],
+    });
+
+    const result = await resolveForAgent({
+      cfg,
+      target: { channel: "telegram", to: "user:123456" },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.accountId).toBe("session-account");
+  });
+
   it("reroutes implicit whatsapp delivery to authorized allowFrom recipient", async () => {
     setMainSessionEntry({
       sessionId: "sess-w1",

@@ -36,6 +36,93 @@ export type DeliveryTargetResolution =
       error: Error;
     };
 
+type SessionStore = ReturnType<typeof loadSessionStore>;
+
+function normalizeDeliveryTargetForMatch(target: string, channel: string): string {
+  let normalized = target.trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  const channelPrefix = `${channel.trim().toLowerCase()}:`;
+  if (normalized.startsWith(channelPrefix)) {
+    normalized = normalized.slice(channelPrefix.length).trim();
+  }
+  for (const prefix of ["user:", "dm:", "chat:", "group:", "channel:"]) {
+    if (normalized.startsWith(prefix)) {
+      normalized = normalized.slice(prefix.length).trim();
+      break;
+    }
+  }
+  return normalized;
+}
+
+function readSessionDeliveryChannel(entry: SessionStore[string]): string | undefined {
+  const fromContext = entry.deliveryContext?.channel;
+  if (typeof fromContext === "string" && fromContext.trim()) {
+    return fromContext.trim().toLowerCase();
+  }
+  if (typeof entry.lastChannel === "string" && entry.lastChannel.trim()) {
+    return entry.lastChannel.trim().toLowerCase();
+  }
+  return undefined;
+}
+
+function readSessionDeliveryTarget(entry: SessionStore[string]): string | undefined {
+  const fromContext = entry.deliveryContext?.to;
+  if (typeof fromContext === "string" && fromContext.trim()) {
+    return fromContext.trim();
+  }
+  if (typeof entry.lastTo === "string" && entry.lastTo.trim()) {
+    return entry.lastTo.trim();
+  }
+  return undefined;
+}
+
+function readSessionDeliveryAccountId(entry: SessionStore[string]): string | undefined {
+  const fromContext = entry.deliveryContext?.accountId;
+  if (typeof fromContext === "string" && fromContext.trim()) {
+    return fromContext.trim();
+  }
+  if (typeof entry.lastAccountId === "string" && entry.lastAccountId.trim()) {
+    return entry.lastAccountId.trim();
+  }
+  return undefined;
+}
+
+function inferAccountIdForExplicitTarget(params: {
+  store: SessionStore;
+  channel: Exclude<OutboundChannel, "none">;
+  explicitTo: string;
+}): string | undefined {
+  const targetKey = normalizeDeliveryTargetForMatch(params.explicitTo, params.channel);
+  if (!targetKey) {
+    return undefined;
+  }
+  let selected: { accountId: string; updatedAt: number } | undefined;
+  for (const entry of Object.values(params.store)) {
+    const entryChannel = readSessionDeliveryChannel(entry);
+    if (!entryChannel || entryChannel !== params.channel) {
+      continue;
+    }
+    const accountId = readSessionDeliveryAccountId(entry);
+    if (!accountId) {
+      continue;
+    }
+    const entryTarget = readSessionDeliveryTarget(entry);
+    if (!entryTarget) {
+      continue;
+    }
+    if (normalizeDeliveryTargetForMatch(entryTarget, params.channel) !== targetKey) {
+      continue;
+    }
+    const updatedAt = Number.isFinite(entry.updatedAt) ? entry.updatedAt : 0;
+    if (!selected || updatedAt >= selected.updatedAt) {
+      selected = { accountId, updatedAt };
+    }
+  }
+  return selected?.accountId;
+}
+
 export async function resolveDeliveryTarget(
   cfg: OpenClawConfig,
   agentId: string,
@@ -105,6 +192,13 @@ export async function resolveDeliveryTarget(
   // This ensures the message tool in isolated sessions resolves the correct
   // bot token for multi-account setups.
   let accountId = resolved.accountId;
+  if (!accountId && channel && explicitTo) {
+    accountId = inferAccountIdForExplicitTarget({
+      store,
+      channel,
+      explicitTo,
+    });
+  }
   if (!accountId && channel) {
     const bindings = buildChannelAccountBindings(cfg);
     const byAgent = bindings.get(channel);

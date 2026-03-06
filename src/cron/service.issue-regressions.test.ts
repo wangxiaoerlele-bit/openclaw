@@ -931,6 +931,63 @@ describe("Cron issue regressions", () => {
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
   });
 
+  it("auto-disables recurring isolated jobs after two consecutive timeout failures", async () => {
+    vi.useRealTimers();
+    const store = await makeStorePath();
+    const scheduledAt = Date.parse("2026-02-15T13:00:00.000Z");
+    const cronJob = createIsolatedRegressionJob({
+      id: "timeout-auto-disable",
+      name: "timeout auto disable",
+      scheduledAt,
+      schedule: { kind: "every", everyMs: 60_000, anchorMs: scheduledAt },
+      payload: { kind: "agentTurn", message: "work", timeoutSeconds: 0.01 },
+      state: { nextRunAtMs: scheduledAt },
+    });
+    await writeCronJobs(store.storePath, [cronJob]);
+
+    let now = scheduledAt;
+    const abortAwareRunner = createAbortAwareIsolatedRunner();
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob: vi.fn(async (params) => {
+        const result = await abortAwareRunner.runIsolatedAgentJob(params);
+        now += 5;
+        return result;
+      }),
+    });
+
+    await onTimer(state);
+
+    let job = state.store?.jobs.find((entry) => entry.id === "timeout-auto-disable");
+    expect(job?.state.lastStatus).toBe("error");
+    expect(job?.state.lastError).toContain("timed out");
+    expect(job?.state.consecutiveErrors).toBe(1);
+    expect(job?.enabled).toBe(true);
+    expect(job?.state.nextRunAtMs).toBeDefined();
+
+    now = job?.state.nextRunAtMs ?? now + 60_000;
+    await onTimer(state);
+
+    job = state.store?.jobs.find((entry) => entry.id === "timeout-auto-disable");
+    expect(job?.state.lastStatus).toBe("error");
+    expect(job?.state.lastError).toContain("timed out");
+    expect(job?.state.consecutiveErrors).toBe(2);
+    expect(job?.enabled).toBe(false);
+    expect(job?.state.nextRunAtMs).toBeUndefined();
+    expect(noopLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: "timeout-auto-disable",
+        threshold: 2,
+      }),
+      "cron: auto-disabled recurring job after consecutive timeout failures",
+    );
+  });
+
   it("applies timeoutSeconds to manual cron.run isolated executions", async () => {
     vi.useRealTimers();
     const store = await makeStorePath();

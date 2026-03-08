@@ -42,6 +42,7 @@ import { buildReplyPayloads } from "./agent-runner-payloads.js";
 import { appendUsageLine, formatResponseUsageLine } from "./agent-runner-utils.js";
 import { createAudioAsVoiceBuffer, createBlockReplyPipeline } from "./block-reply-pipeline.js";
 import { resolveBlockStreamingCoalescing } from "./block-streaming.js";
+import { applyExecutionTaskGuard } from "./execution-task-guard.js";
 import { createFollowupRunner } from "./followup-runner.js";
 import { resolveOriginMessageProvider, resolveOriginMessageTo } from "./origin-routing.js";
 import {
@@ -524,7 +525,6 @@ export async function runReplyAgent(params: {
       directlySentBlockKeys,
       replyToMode,
       replyToChannel,
-      chatType: sessionCtx.ChatType,
       currentMessageId: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
       messageProvider: followupRun.run.messageProvider,
       messagingToolSentTexts: runResult.messagingToolSentTexts,
@@ -555,8 +555,20 @@ export async function runReplyAgent(params: {
       hasReminderCommitment && successfulCronAdds === 0
         ? appendUnscheduledReminderNote(replyPayloads)
         : replyPayloads;
+    const executionGuardedReplyPayloads = isHeartbeat
+      ? guardedReplyPayloads
+      : await applyExecutionTaskGuard({
+          payloads: guardedReplyPayloads,
+          commandBody,
+          sessionKey,
+          agentId: followupRun.run.agentId,
+          originMessageId: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
+          successfulMutatingToolCalls: runResult.successfulMutatingToolCalls,
+          successfulCronAdds,
+          didSendViaMessagingTool: runResult.didSendViaMessagingTool,
+        });
 
-    await signalTypingIfNeeded(guardedReplyPayloads, typingSignals);
+    await signalTypingIfNeeded(executionGuardedReplyPayloads, typingSignals);
 
     if (isDiagnosticsEnabled(cfg) && hasNonzeroUsage(usage)) {
       const input = usage.input ?? 0;
@@ -624,7 +636,7 @@ export async function runReplyAgent(params: {
     }
 
     // If verbose is enabled, prepend operational run notices.
-    let finalPayloads = guardedReplyPayloads;
+    let finalPayloads = executionGuardedReplyPayloads;
     const verboseNotices: ReplyPayload[] = [];
 
     if (verboseEnabled && activeIsNewSession) {

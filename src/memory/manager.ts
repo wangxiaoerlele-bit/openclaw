@@ -13,6 +13,7 @@ import {
   type EmbeddingProviderResult,
   type GeminiEmbeddingClient,
   type MistralEmbeddingClient,
+  type OllamaEmbeddingClient,
   type OpenAiEmbeddingClient,
   type VoyageEmbeddingClient,
 } from "./embeddings.js";
@@ -22,7 +23,6 @@ import { isMemoryPath, normalizeExtraMemoryPaths } from "./internal.js";
 import { MemoryManagerEmbeddingOps } from "./manager-embedding-ops.js";
 import { searchKeyword, searchVector } from "./manager-search.js";
 import { extractKeywords } from "./query-expansion.js";
-import { resolveMemoryTierFromPath, resolveMemoryTierRank, scoreWithTierBoost } from "./tiering.js";
 import type {
   MemoryEmbeddingProbeResult,
   MemoryProviderStatus,
@@ -40,6 +40,7 @@ const BATCH_FAILURE_LIMIT = 2;
 const log = createSubsystemLogger("memory");
 
 const INDEX_CACHE = new Map<string, MemoryIndexManager>();
+const INDEX_CACHE_PENDING = new Map<string, Promise<MemoryIndexManager>>();
 
 export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements MemorySearchManager {
   private readonly cacheKey: string;
@@ -47,16 +48,23 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   protected readonly agentId: string;
   protected readonly workspaceDir: string;
   protected readonly settings: ResolvedMemorySearchConfig;
-  protected readonly tiering: ResolvedMemorySearchConfig["tiering"];
   protected provider: EmbeddingProvider | null;
-  private readonly requestedProvider: "openai" | "local" | "gemini" | "voyage" | "mistral" | "auto";
-  protected fallbackFrom?: "openai" | "local" | "gemini" | "voyage" | "mistral";
+  private readonly requestedProvider:
+    | "openai"
+    | "local"
+    | "gemini"
+    | "voyage"
+    | "mistral"
+    | "ollama"
+    | "auto";
+  protected fallbackFrom?: "openai" | "local" | "gemini" | "voyage" | "mistral" | "ollama";
   protected fallbackReason?: string;
   private readonly providerUnavailableReason?: string;
   protected openAi?: OpenAiEmbeddingClient;
   protected gemini?: GeminiEmbeddingClient;
   protected voyage?: VoyageEmbeddingClient;
   protected mistral?: MistralEmbeddingClient;
+  protected ollama?: OllamaEmbeddingClient;
   protected batch: {
     enabled: boolean;
     wait: boolean;
@@ -101,6 +109,10 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   >();
   private sessionWarm = new Set<string>();
   private syncing: Promise<void> | null = null;
+  private readonlyRecoveryAttempts = 0;
+  private readonlyRecoverySuccesses = 0;
+  private readonlyRecoveryFailures = 0;
+  private readonlyRecoveryLastError?: string;
 
   static async get(params: {
     cfg: OpenClawConfig;
@@ -108,36 +120,55 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     purpose?: "default" | "status";
   }): Promise<MemoryIndexManager | null> {
     const { cfg, agentId } = params;
+    const purpose = params.purpose ?? "default";
     const settings = resolveMemorySearchConfig(cfg, agentId);
     if (!settings) {
       return null;
     }
     const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
-    const key = `${agentId}:${workspaceDir}:${JSON.stringify(settings)}`;
+    const key = `${agentId}:${purpose}:${workspaceDir}:${JSON.stringify(settings)}`;
     const existing = INDEX_CACHE.get(key);
     if (existing) {
       return existing;
     }
-    const providerResult = await createEmbeddingProvider({
-      config: cfg,
-      agentDir: resolveAgentDir(cfg, agentId),
-      provider: settings.provider,
-      remote: settings.remote,
-      model: settings.model,
-      fallback: settings.fallback,
-      local: settings.local,
-    });
-    const manager = new MemoryIndexManager({
-      cacheKey: key,
-      cfg,
-      agentId,
-      workspaceDir,
-      settings,
-      providerResult,
-      purpose: params.purpose,
-    });
-    INDEX_CACHE.set(key, manager);
-    return manager;
+    const pending = INDEX_CACHE_PENDING.get(key);
+    if (pending) {
+      return pending;
+    }
+    const createPromise = (async () => {
+      const providerResult = await createEmbeddingProvider({
+        config: cfg,
+        agentDir: resolveAgentDir(cfg, agentId),
+        provider: settings.provider,
+        remote: settings.remote,
+        model: settings.model,
+        fallback: settings.fallback,
+        local: settings.local,
+      });
+      const refreshed = INDEX_CACHE.get(key);
+      if (refreshed) {
+        return refreshed;
+      }
+      const manager = new MemoryIndexManager({
+        cacheKey: key,
+        cfg,
+        agentId,
+        workspaceDir,
+        settings,
+        providerResult,
+        purpose: params.purpose,
+      });
+      INDEX_CACHE.set(key, manager);
+      return manager;
+    })();
+    INDEX_CACHE_PENDING.set(key, createPromise);
+    try {
+      return await createPromise;
+    } finally {
+      if (INDEX_CACHE_PENDING.get(key) === createPromise) {
+        INDEX_CACHE_PENDING.delete(key);
+      }
+    }
   }
 
   private constructor(params: {
@@ -155,7 +186,6 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     this.agentId = params.agentId;
     this.workspaceDir = params.workspaceDir;
     this.settings = params.settings;
-    this.tiering = params.settings.tiering;
     this.provider = params.providerResult.provider;
     this.requestedProvider = params.providerResult.requestedProvider;
     this.fallbackFrom = params.providerResult.fallbackFrom;
@@ -165,6 +195,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     this.gemini = params.providerResult.gemini;
     this.voyage = params.providerResult.voyage;
     this.mistral = params.providerResult.mistral;
+    this.ollama = params.providerResult.ollama;
     this.sources = new Set(params.settings.sources);
     this.db = this.openDatabase();
     this.providerKey = this.computeProviderKey();
@@ -261,15 +292,19 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         }
       }
 
-      return this.applyTierAwareRanking([...seenIds.values()], {
-        minScore,
-        maxResults,
-      });
+      const merged = [...seenIds.values()]
+        .toSorted((a, b) => b.score - a.score)
+        .filter((entry) => entry.score >= minScore)
+        .slice(0, maxResults);
+
+      return merged;
     }
 
-    const keywordResults = hybrid.enabled
-      ? await this.searchKeyword(cleaned, candidates).catch(() => [])
-      : [];
+    // If FTS isn't available, hybrid mode cannot use keyword search; degrade to vector-only.
+    const keywordResults =
+      hybrid.enabled && this.fts.enabled && this.fts.available
+        ? await this.searchKeyword(cleaned, candidates).catch(() => [])
+        : [];
 
     const queryVec = await this.embedQueryWithTimeout(cleaned);
     const hasVector = queryVec.some((v) => v !== 0);
@@ -277,11 +312,8 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       ? await this.searchVector(queryVec, candidates).catch(() => [])
       : [];
 
-    if (!hybrid.enabled) {
-      return this.applyTierAwareRanking(vectorResults, {
-        minScore,
-        maxResults,
-      });
+    if (!hybrid.enabled || !this.fts.enabled || !this.fts.available) {
+      return vectorResults.filter((entry) => entry.score >= minScore).slice(0, maxResults);
     }
 
     const merged = await this.mergeHybridResults({
@@ -292,33 +324,28 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       mmr: hybrid.mmr,
       temporalDecay: hybrid.temporalDecay,
     });
-
-    return this.applyTierAwareRanking(merged, { minScore, maxResults });
-  }
-
-  private applyTierAwareRanking(
-    results: MemorySearchResult[],
-    params: { minScore: number; maxResults: number },
-  ): MemorySearchResult[] {
-    if (results.length === 0) {
-      return [];
+    const strict = merged.filter((entry) => entry.score >= minScore);
+    if (strict.length > 0 || keywordResults.length === 0) {
+      return strict.slice(0, maxResults);
     }
-    const boosted = results.map((entry) => ({
-      ...entry,
-      score: scoreWithTierBoost(entry.score, entry.path, this.tiering),
-    }));
-    const ranked = boosted.toSorted((a, b) => {
-      if (a.score !== b.score) {
-        return b.score - a.score;
-      }
-      const tierA = resolveMemoryTierRank(resolveMemoryTierFromPath(a.path));
-      const tierB = resolveMemoryTierRank(resolveMemoryTierFromPath(b.path));
-      if (tierA !== tierB) {
-        return tierB - tierA;
-      }
-      return a.path.localeCompare(b.path);
-    });
-    return ranked.filter((entry) => entry.score >= params.minScore).slice(0, params.maxResults);
+
+    // Hybrid defaults can produce keyword-only matches with max score equal to
+    // textWeight (for example 0.3). If minScore is higher (for example 0.35),
+    // these exact lexical hits get filtered out even when they are the only
+    // relevant results.
+    const relaxedMinScore = Math.min(minScore, hybrid.textWeight);
+    const keywordKeys = new Set(
+      keywordResults.map(
+        (entry) => `${entry.source}:${entry.path}:${entry.startLine}:${entry.endLine}`,
+      ),
+    );
+    return merged
+      .filter(
+        (entry) =>
+          keywordKeys.has(`${entry.source}:${entry.path}:${entry.startLine}:${entry.endLine}`) &&
+          entry.score >= relaxedMinScore,
+      )
+      .slice(0, maxResults);
   }
 
   private async searchVector(
@@ -417,10 +444,95 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     if (this.syncing) {
       return this.syncing;
     }
-    this.syncing = this.runSync(params).finally(() => {
+    this.syncing = this.runSyncWithReadonlyRecovery(params).finally(() => {
       this.syncing = null;
     });
     return this.syncing ?? Promise.resolve();
+  }
+
+  private isReadonlyDbError(err: unknown): boolean {
+    const readonlyPattern =
+      /attempt to write a readonly database|database is read-only|SQLITE_READONLY/i;
+    const messages = new Set<string>();
+
+    const pushValue = (value: unknown): void => {
+      if (typeof value !== "string") {
+        return;
+      }
+      const normalized = value.trim();
+      if (!normalized) {
+        return;
+      }
+      messages.add(normalized);
+    };
+
+    pushValue(err instanceof Error ? err.message : String(err));
+    if (err && typeof err === "object") {
+      const record = err as Record<string, unknown>;
+      pushValue(record.message);
+      pushValue(record.code);
+      pushValue(record.name);
+      if (record.cause && typeof record.cause === "object") {
+        const cause = record.cause as Record<string, unknown>;
+        pushValue(cause.message);
+        pushValue(cause.code);
+        pushValue(cause.name);
+      }
+    }
+
+    return [...messages].some((value) => readonlyPattern.test(value));
+  }
+
+  private extractErrorReason(err: unknown): string {
+    if (err instanceof Error && err.message.trim()) {
+      return err.message;
+    }
+    if (err && typeof err === "object") {
+      const record = err as Record<string, unknown>;
+      if (typeof record.message === "string" && record.message.trim()) {
+        return record.message;
+      }
+      if (typeof record.code === "string" && record.code.trim()) {
+        return record.code;
+      }
+    }
+    return String(err);
+  }
+
+  private async runSyncWithReadonlyRecovery(params?: {
+    reason?: string;
+    force?: boolean;
+    progress?: (update: MemorySyncProgressUpdate) => void;
+  }): Promise<void> {
+    try {
+      await this.runSync(params);
+      return;
+    } catch (err) {
+      if (!this.isReadonlyDbError(err) || this.closed) {
+        throw err;
+      }
+      const reason = this.extractErrorReason(err);
+      this.readonlyRecoveryAttempts += 1;
+      this.readonlyRecoveryLastError = reason;
+      log.warn(`memory sync readonly handle detected; reopening sqlite connection`, { reason });
+      try {
+        this.db.close();
+      } catch {}
+      this.db = this.openDatabase();
+      this.vectorReady = null;
+      this.vector.available = null;
+      this.vector.loadError = undefined;
+      this.ensureSchema();
+      const meta = this.readMeta();
+      this.vector.dims = meta?.vectorDims;
+      try {
+        await this.runSync(params);
+        this.readonlyRecoverySuccesses += 1;
+      } catch (retryErr) {
+        this.readonlyRecoveryFailures += 1;
+        throw retryErr;
+      }
+    }
   }
 
   async readFile(params: {
@@ -539,34 +651,6 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       }
       return sources.map((source) => Object.assign({ source }, bySource.get(source)!));
     })();
-    const tierCounts = (() => {
-      const row = this.db
-        .prepare(
-          `SELECT\n` +
-            `  SUM(CASE WHEN source = 'memory' AND path LIKE 'memory/hot/%' THEN 1 ELSE 0 END) AS hot,\n` +
-            `  SUM(CASE WHEN source = 'memory' AND path LIKE 'memory/warm/%' THEN 1 ELSE 0 END) AS warm,\n` +
-            `  SUM(CASE WHEN source = 'memory' AND path LIKE 'memory/cold/%' THEN 1 ELSE 0 END) AS cold,\n` +
-            `  SUM(CASE\n` +
-            `    WHEN source = 'memory' AND path LIKE 'memory/%' AND path NOT LIKE 'memory/hot/%'\n` +
-            `      AND path NOT LIKE 'memory/warm/%' AND path NOT LIKE 'memory/cold/%'\n` +
-            `    THEN 1 ELSE 0 END) AS legacy\n` +
-            ` FROM files`,
-        )
-        .get() as
-        | {
-            hot: number | null;
-            warm: number | null;
-            cold: number | null;
-            legacy: number | null;
-          }
-        | undefined;
-      return {
-        hot: row?.hot ?? 0,
-        warm: row?.warm ?? 0,
-        cold: row?.cold ?? 0,
-        legacy: row?.legacy ?? 0,
-      };
-    })();
 
     // Determine search mode: "fts-only" if no provider, "hybrid" otherwise
     const searchMode = this.provider ? "hybrid" : "fts-only";
@@ -628,12 +712,11 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       custom: {
         searchMode,
         providerUnavailableReason: this.providerUnavailableReason,
-        tiering: {
-          enabled: this.tiering.enabled,
-          autoMigrate: this.tiering.autoMigrate,
-          hotWindowDays: this.tiering.hotWindowDays,
-          warmWindowDays: this.tiering.warmWindowDays,
-          files: tierCounts,
+        readonlyRecovery: {
+          attempts: this.readonlyRecoveryAttempts,
+          successes: this.readonlyRecoverySuccesses,
+          failures: this.readonlyRecoveryFailures,
+          lastError: this.readonlyRecoveryLastError,
         },
       },
     };

@@ -45,6 +45,7 @@ import { createEmptyPluginRegistry } from "../plugins/registry.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
 import { getTotalQueueSize } from "../process/command-queue.js";
 import type { RuntimeEnv } from "../runtime.js";
+import { TaskService } from "../tasks/service.js";
 import { runOnboardingWizard } from "../wizard/onboarding.js";
 import { createAuthRateLimiter, type AuthRateLimiter } from "./auth-rate-limit.js";
 import { startChannelHealthMonitor } from "./channel-health-monitor.js";
@@ -529,6 +530,12 @@ export async function startGatewayServer(
         updateConfig: () => {},
       }
     : startHeartbeatRunner({ cfg: cfgAtStart });
+  const taskService = minimalTestGateway
+    ? null
+    : new TaskService({
+        loadConfig,
+        deps,
+      });
 
   const healthCheckMinutes = cfgAtStart.gateway?.channelHealthCheckMinutes;
   const healthCheckDisabled = healthCheckMinutes === 0;
@@ -541,6 +548,9 @@ export async function startGatewayServer(
 
   if (!minimalTestGateway) {
     void cron.start().catch((err) => logCron.error(`failed to start: ${String(err)}`));
+    void taskService
+      ?.start()
+      .catch((err) => log.error(`task service failed to start: ${String(err)}`));
   }
 
   // Recover pending outbound deliveries from previous crash/restart.
@@ -742,6 +752,7 @@ export async function startGatewayServer(
     stopChannel,
     pluginServices,
     cron,
+    taskService,
     heartbeatRunner,
     updateCheckStop: stopGatewayUpdateCheck,
     nodePresenceTimers,

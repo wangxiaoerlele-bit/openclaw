@@ -1,9 +1,35 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { ClawdbotConfig } from "openclaw/plugin-sdk";
+import type { ClawdbotConfig } from "openclaw/plugin-sdk/feishu";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const probeFeishuMock = vi.hoisted(() => vi.fn());
+
+vi.mock("./probe.js", () => ({
+  probeFeishu: probeFeishuMock,
+}));
+
+vi.mock("./client.js", () => ({
+  createFeishuWSClient: vi.fn(() => ({ start: vi.fn() })),
+  createEventDispatcher: vi.fn(() => ({ register: vi.fn() })),
+}));
+
+vi.mock("./runtime.js", () => ({
+  getFeishuRuntime: () => ({
+    channel: {
+      debounce: {
+        resolveInboundDebounceMs: () => 0,
+        createInboundDebouncer: () => ({
+          enqueue: async () => {},
+          flushKey: async () => {},
+        }),
+      },
+      text: {
+        hasControlCommand: () => false,
+      },
+    },
+  }),
+}));
 
 vi.mock("@larksuiteoapi/node-sdk", () => ({
   adaptDefault: vi.fn(
@@ -14,30 +40,13 @@ vi.mock("@larksuiteoapi/node-sdk", () => ({
   ),
 }));
 
-vi.mock("./probe.js", () => ({
-  probeFeishu: probeFeishuMock,
-}));
-
-vi.mock("./client.js", () => ({
-  createFeishuWSClient: vi.fn(() => ({ start: vi.fn() })),
-  createEventDispatcher: vi.fn(() => ({
-    register: vi.fn(),
-    invoke: vi.fn(async () => undefined),
-    encryptKey: "",
-    verificationToken: "",
-  })),
-  createCardActionHandler: vi.fn(() => ({
-    invoke: vi.fn(async () => undefined),
-    requestHandle: { parse: vi.fn((v) => v) },
-    cardHandler: vi.fn(async () => undefined),
-  })),
-}));
-
-vi.mock("./memory-suggestion-actions.js", () => ({
-  handleFeishuPersonalMemoryCardAction: vi.fn(async () => undefined),
-}));
-
-import { monitorFeishuProvider, stopFeishuMonitor } from "./monitor.js";
+import {
+  clearFeishuWebhookRateLimitStateForTest,
+  getFeishuWebhookRateLimitStateSizeForTest,
+  isWebhookRateLimitedForTest,
+  monitorFeishuProvider,
+  stopFeishuMonitor,
+} from "./monitor.js";
 
 async function getFreePort(): Promise<number> {
   const server = createServer();
@@ -128,6 +137,7 @@ async function withRunningWebhookMonitor(
 }
 
 afterEach(() => {
+  clearFeishuWebhookRateLimitStateForTest();
   stopFeishuMonitor();
 });
 
@@ -193,5 +203,24 @@ describe("Feishu webhook security hardening", () => {
         expect(saw429).toBe(true);
       },
     );
+  });
+
+  it("caps tracked webhook rate-limit keys to prevent unbounded growth", () => {
+    const now = 1_000_000;
+    for (let i = 0; i < 4_500; i += 1) {
+      isWebhookRateLimitedForTest(`/feishu-rate-limit:key-${i}`, now);
+    }
+    expect(getFeishuWebhookRateLimitStateSizeForTest()).toBeLessThanOrEqual(4_096);
+  });
+
+  it("prunes stale webhook rate-limit state after window elapses", () => {
+    const now = 2_000_000;
+    for (let i = 0; i < 100; i += 1) {
+      isWebhookRateLimitedForTest(`/feishu-rate-limit-stale:key-${i}`, now);
+    }
+    expect(getFeishuWebhookRateLimitStateSizeForTest()).toBe(100);
+
+    isWebhookRateLimitedForTest("/feishu-rate-limit-stale:fresh", now + 60_001);
+    expect(getFeishuWebhookRateLimitStateSizeForTest()).toBe(1);
   });
 });

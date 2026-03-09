@@ -45,8 +45,8 @@ describe("plugin-sdk root alias", () => {
   it("keeps the fast emptyPluginConfigSchema helper aligned with compat exports", () => {
     const rootSdk = loadFreshRootSdk();
     const buildSchema = rootSdk.emptyPluginConfigSchema as typeof compatSdk.emptyPluginConfigSchema;
-    const rootSchema = buildSchema();
-    const compatSchema = compatSdk.emptyPluginConfigSchema();
+    const rootSchema = buildSchema() as EmptySchema;
+    const compatSchema = compatSdk.emptyPluginConfigSchema() as EmptySchema;
 
     for (const value of [undefined, {}, { invalid: true }, [], "text"]) {
       expect(rootSchema.safeParse(value)).toEqual(compatSchema.safeParse(value));
@@ -61,7 +61,7 @@ describe("plugin-sdk root alias", () => {
       allowTextCommands: true,
       hasControlCommand: true,
       useAccessGroups: false,
-      modeWhenAccessGroupsOff: "configured-only",
+      modeWhenAccessGroupsOff: "configured",
       authorizers: [
         { configured: false, allowed: false },
         { configured: true, allowed: false },

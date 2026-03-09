@@ -316,7 +316,7 @@ describe("exec approvals command resolution", () => {
       "needle",
     ]);
     expect(resolution?.policyBlocked).toBe(true);
-    expect(resolution?.rawExecutable).toBe("/usr/bin/env");
+    expect(resolution?.rawExecutable).toBe("rg");
   });
 
   it("fails closed for env -S even when env itself is allowlisted", () => {

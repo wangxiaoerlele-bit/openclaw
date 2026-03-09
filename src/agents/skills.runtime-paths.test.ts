@@ -31,6 +31,9 @@ describe("skill runtime path integration", () => {
             (candidate) => candidate.skill.name === "browser-use",
           );
           expect(entry).toBeDefined();
+          if (!entry) {
+            throw new Error("Expected browser-use skill entry to exist");
+          }
 
           const runtimeDir = path.join(resolveSkillToolsRootDir(entry), "runtime");
           await fs.mkdir(runtimeDir, { recursive: true });

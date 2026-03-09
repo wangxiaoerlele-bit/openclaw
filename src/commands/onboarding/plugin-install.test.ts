@@ -3,11 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
+  const existsSync = vi.fn<typeof actual.existsSync>();
   return {
     ...actual,
+    existsSync,
     default: {
-      ...actual.default,
-      existsSync: vi.fn(),
+      ...actual,
+      existsSync,
     },
   };
 });
@@ -21,7 +23,7 @@ vi.mock("../../plugins/loader.js", () => ({
   loadOpenClawPlugins: vi.fn(),
 }));
 
-import fs from "node:fs";
+import * as fs from "node:fs";
 import type { ChannelPluginCatalogEntry } from "../../channels/plugins/catalog.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { WizardPrompter } from "../../wizard/prompts.js";

@@ -484,7 +484,7 @@ export function resolveDispatchWrapperExecutionPlan(
     wrappers.push(unwrap.wrapper);
     if (isSemanticDispatchWrapperUsage(unwrap.wrapper, current)) {
       return blockedDispatchWrapperPlan({
-        argv: current,
+        argv: unwrap.argv,
         wrappers,
         blockedWrapper: unwrap.wrapper,
       });

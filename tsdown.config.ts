@@ -1,4 +1,5 @@
 import { defineConfig } from "tsdown";
+import { pluginSdkExportEntries } from "./src/plugin-sdk/export-manifest.ts";
 
 const env = {
   NODE_ENV: "production",
@@ -31,19 +32,30 @@ export default defineConfig([
     platform: "node",
   },
   {
-    entry: "src/plugin-sdk/index.ts",
-    outDir: "dist/plugin-sdk",
+    // Keep sync lazy-runtime channel modules as concrete dist files.
+    entry: {
+      "channels/plugins/agent-tools/whatsapp-login":
+        "src/channels/plugins/agent-tools/whatsapp-login.ts",
+      "channels/plugins/actions/discord": "src/channels/plugins/actions/discord.ts",
+      "channels/plugins/actions/signal": "src/channels/plugins/actions/signal.ts",
+      "channels/plugins/actions/telegram": "src/channels/plugins/actions/telegram.ts",
+      "telegram/audit": "src/telegram/audit.ts",
+      "telegram/token": "src/telegram/token.ts",
+      "line/accounts": "src/line/accounts.ts",
+      "line/send": "src/line/send.ts",
+      "line/template-messages": "src/line/template-messages.ts",
+    },
     env,
     fixedExtension: false,
     platform: "node",
   },
-  {
-    entry: "src/plugin-sdk/account-id.ts",
+  ...pluginSdkExportEntries.map((entry) => ({
+    entry: `src/plugin-sdk/${entry.srcFile}`,
     outDir: "dist/plugin-sdk",
     env,
     fixedExtension: false,
-    platform: "node",
-  },
+    platform: "node" as const,
+  })),
   {
     entry: "src/extensionAPI.ts",
     env,

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildBaseAccountStatusSnapshot,
   buildBaseChannelStatusSummary,
+  buildProbeChannelStatusSummary,
   buildTokenChannelStatusSummary,
   collectStatusIssuesFromLastError,
   createDefaultChannelRuntimeState,
@@ -84,6 +85,36 @@ describe("buildBaseAccountStatusSnapshot", () => {
       probe: undefined,
       lastInboundAt: null,
       lastOutboundAt: null,
+    });
+  });
+});
+
+describe("buildProbeChannelStatusSummary", () => {
+  it("keeps base lifecycle fields and adds probe metadata", () => {
+    expect(
+      buildProbeChannelStatusSummary(
+        {
+          configured: true,
+          running: true,
+          lastStartAt: 1,
+          lastStopAt: 2,
+          lastError: "boom",
+          probe: { ok: true },
+          lastProbeAt: 3,
+        },
+        {
+          mode: "poll",
+        },
+      ),
+    ).toEqual({
+      configured: true,
+      running: true,
+      lastStartAt: 1,
+      lastStopAt: 2,
+      lastError: "boom",
+      mode: "poll",
+      probe: { ok: true },
+      lastProbeAt: 3,
     });
   });
 });

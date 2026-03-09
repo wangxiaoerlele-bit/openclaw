@@ -8,7 +8,12 @@ import type { TypingMode } from "../../config/types.js";
 import { withStateDirEnv } from "../../test-helpers/state-dir-env.js";
 import type { TemplateContext } from "../templating.js";
 import type { GetReplyOptions } from "../types.js";
-import { enqueueFollowupRun, type FollowupRun, type QueueSettings } from "./queue.js";
+import {
+  enqueueFollowupRun,
+  scheduleFollowupDrain,
+  type FollowupRun,
+  type QueueSettings,
+} from "./queue.js";
 import { createMockTypingController } from "./test-helpers.js";
 
 type AgentRunParams = {
@@ -23,6 +28,8 @@ type AgentRunParams = {
 type EmbeddedRunParams = {
   prompt?: string;
   extraSystemPrompt?: string;
+  bootstrapPromptWarningSignaturesSeen?: string[];
+  bootstrapPromptWarningSignature?: string;
   onAgentEvent?: (evt: { stream?: string; data?: { phase?: string; willRetry?: boolean } }) => void;
 };
 
@@ -87,6 +94,7 @@ beforeEach(() => {
   state.runEmbeddedPiAgentMock.mockClear();
   state.runCliAgentMock.mockClear();
   vi.mocked(enqueueFollowupRun).mockClear();
+  vi.mocked(scheduleFollowupDrain).mockClear();
   vi.stubEnv("OPENCLAW_TEST_FAST", "1");
 });
 
@@ -311,6 +319,25 @@ describe("runReplyAgent heartbeat followup guard", () => {
     expect(vi.mocked(enqueueFollowupRun)).toHaveBeenCalledTimes(1);
     expect(state.runEmbeddedPiAgentMock).not.toHaveBeenCalled();
   });
+
+  it("drains followup queue when an unexpected exception escapes the run path", async () => {
+    const accounting = await import("./session-run-accounting.js");
+    const persistSpy = vi
+      .spyOn(accounting, "persistRunSessionUsage")
+      .mockRejectedValueOnce(new Error("persist exploded"));
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "ok" }],
+      meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+    });
+
+    try {
+      const { run } = createMinimalRun();
+      await expect(run()).rejects.toThrow("persist exploded");
+      expect(vi.mocked(scheduleFollowupDrain)).toHaveBeenCalledTimes(1);
+    } finally {
+      persistSpy.mockRestore();
+    }
+  });
 });
 
 describe("runReplyAgent typing (heartbeat)", () => {
@@ -385,7 +412,7 @@ describe("runReplyAgent typing (heartbeat)", () => {
         shouldType: false,
       },
       {
-        partials: ["NO_", "NO_RE", "NO_REPLY"],
+        partials: ["NO", "NO_", "NO_RE", "NO_REPLY"],
         finalText: "NO_REPLY",
         expectedForwarded: [] as string[],
         shouldType: false,
@@ -1089,7 +1116,7 @@ describe("runReplyAgent typing (heartbeat)", () => {
       const sessionId = "session";
       const storePath = path.join(stateDir, "sessions", "sessions.json");
       const transcriptPath = sessions.resolveSessionTranscriptPath(sessionId);
-      const sessionEntry = {
+      const sessionEntry: SessionEntry = {
         sessionId,
         updatedAt: Date.now(),
         sessionFile: transcriptPath,
@@ -1186,6 +1213,54 @@ describe("runReplyAgent typing (heartbeat)", () => {
       const persisted = JSON.parse(await fs.readFile(storePath, "utf-8"));
       expect(persisted.main.sessionId).toBe(sessionStore.main.sessionId);
     });
+  });
+
+  it("surfaces overflow fallback when embedded run returns empty payloads", async () => {
+    state.runEmbeddedPiAgentMock.mockImplementationOnce(async () => ({
+      payloads: [],
+      meta: {
+        durationMs: 1,
+        error: {
+          kind: "context_overflow",
+          message: 'Context overflow: Summarization failed: 400 {"message":"prompt is too long"}',
+        },
+      },
+    }));
+
+    const { run } = createMinimalRun();
+    const res = await run();
+    const payload = Array.isArray(res) ? res[0] : res;
+    expect(payload).toMatchObject({
+      text: expect.stringContaining("conversation is too large"),
+    });
+    if (!payload) {
+      throw new Error("expected payload");
+    }
+    expect(payload.text).toContain("/new");
+  });
+
+  it("surfaces overflow fallback when embedded payload text is whitespace-only", async () => {
+    state.runEmbeddedPiAgentMock.mockImplementationOnce(async () => ({
+      payloads: [{ text: "   \n\t  ", isError: true }],
+      meta: {
+        durationMs: 1,
+        error: {
+          kind: "context_overflow",
+          message: 'Context overflow: Summarization failed: 400 {"message":"prompt is too long"}',
+        },
+      },
+    }));
+
+    const { run } = createMinimalRun();
+    const res = await run();
+    const payload = Array.isArray(res) ? res[0] : res;
+    expect(payload).toMatchObject({
+      text: expect.stringContaining("conversation is too large"),
+    });
+    if (!payload) {
+      throw new Error("expected payload");
+    }
+    expect(payload.text).toContain("/new");
   });
 
   it("resets the session after role ordering payloads", async () => {
@@ -1405,7 +1480,7 @@ describe("runReplyAgent memory flush", () => {
   it("skips memory flush for CLI providers", async () => {
     await withTempStore(async (storePath) => {
       const sessionKey = "main";
-      const sessionEntry = {
+      const sessionEntry: SessionEntry = {
         sessionId: "session",
         updatedAt: Date.now(),
         totalTokens: 80_000,
@@ -1441,6 +1516,137 @@ describe("runReplyAgent memory flush", () => {
       const call = state.runCliAgentMock.mock.calls[0]?.[0] as { prompt?: string } | undefined;
       expect(call?.prompt).toBe("hello");
       expect(state.runEmbeddedPiAgentMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it("uses configured prompts for memory flush runs", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      const calls: Array<EmbeddedRunParams> = [];
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        calls.push(params);
+        if (params.prompt?.includes("Write notes.")) {
+          return { payloads: [], meta: {} };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        config: {
+          agents: {
+            defaults: {
+              compaction: {
+                memoryFlush: {
+                  prompt: "Write notes.",
+                  systemPrompt: "Flush memory now.",
+                },
+              },
+            },
+          },
+        },
+        runOverrides: { extraSystemPrompt: "extra system" },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      const flushCall = calls[0];
+      expect(flushCall?.prompt).toContain("Write notes.");
+      expect(flushCall?.prompt).toContain("NO_REPLY");
+      expect(flushCall?.extraSystemPrompt).toContain("extra system");
+      expect(flushCall?.extraSystemPrompt).toContain("Flush memory now.");
+      expect(flushCall?.extraSystemPrompt).toContain("NO_REPLY");
+      expect(calls[1]?.prompt).toBe("hello");
+    });
+  });
+
+  it("passes stored bootstrap warning signatures to memory flush runs", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const sessionEntry: SessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        totalTokens: 80_000,
+        compactionCount: 1,
+        systemPromptReport: {
+          source: "run",
+          generatedAt: Date.now(),
+          systemPrompt: {
+            chars: 1,
+            projectContextChars: 0,
+            nonProjectContextChars: 1,
+          },
+          injectedWorkspaceFiles: [],
+          skills: {
+            promptChars: 0,
+            entries: [],
+          },
+          tools: {
+            listChars: 0,
+            schemaChars: 0,
+            entries: [],
+          },
+          bootstrapTruncation: {
+            warningMode: "once",
+            warningShown: true,
+            promptWarningSignature: "sig-b",
+            warningSignaturesSeen: ["sig-a", "sig-b"],
+            truncatedFiles: 1,
+            nearLimitFiles: 0,
+            totalNearLimit: false,
+          },
+        },
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      const calls: Array<EmbeddedRunParams> = [];
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        calls.push(params);
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          return { payloads: [], meta: {} };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(calls).toHaveLength(2);
+      expect(calls[0]?.bootstrapPromptWarningSignaturesSeen).toEqual(["sig-a", "sig-b"]);
+      expect(calls[0]?.bootstrapPromptWarningSignature).toBe("sig-b");
     });
   });
 
@@ -1490,6 +1696,128 @@ describe("runReplyAgent memory flush", () => {
       const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
       expect(stored[sessionKey].memoryFlushAt).toBeTypeOf("number");
       expect(stored[sessionKey].memoryFlushCompactionCount).toBe(1);
+    });
+  });
+
+  it("runs memory flush when transcript fallback uses a relative sessionFile path", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const sessionFile = "session-relative.jsonl";
+      const transcriptPath = path.join(path.dirname(storePath), sessionFile);
+      await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+      await fs.writeFile(
+        transcriptPath,
+        JSON.stringify({ usage: { input: 90_000, output: 8_000 } }),
+        "utf-8",
+      );
+
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        sessionFile,
+        totalTokens: 10,
+        totalTokensFresh: false,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      const calls: Array<{ prompt?: string }> = [];
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        calls.push({ prompt: params.prompt });
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          return { payloads: [], meta: {} };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        runOverrides: { sessionFile },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(calls).toHaveLength(2);
+      expect(calls[0]?.prompt).toContain("Pre-compaction memory flush.");
+      expect(calls[0]?.prompt).toContain("Current time:");
+      expect(calls[0]?.prompt).toMatch(/memory\/\d{4}-\d{2}-\d{2}\.md/);
+      expect(calls[1]?.prompt).toBe("hello");
+
+      const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+      expect(stored[sessionKey].memoryFlushAt).toBeTypeOf("number");
+    });
+  });
+
+  it("forces memory flush when transcript file exceeds configured byte threshold", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const sessionFile = "oversized-session.jsonl";
+      const transcriptPath = path.join(path.dirname(storePath), sessionFile);
+      await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+      await fs.writeFile(transcriptPath, "x".repeat(3_000), "utf-8");
+
+      const sessionEntry = {
+        sessionId: "session",
+        updatedAt: Date.now(),
+        sessionFile,
+        totalTokens: 10,
+        totalTokensFresh: false,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      const calls: Array<{ prompt?: string }> = [];
+      state.runEmbeddedPiAgentMock.mockImplementation(async (params: EmbeddedRunParams) => {
+        calls.push({ prompt: params.prompt });
+        if (params.prompt?.includes("Pre-compaction memory flush.")) {
+          return { payloads: [], meta: {} };
+        }
+        return {
+          payloads: [{ text: "ok" }],
+          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
+        };
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+        config: {
+          agents: {
+            defaults: {
+              compaction: {
+                memoryFlush: {
+                  forceFlushTranscriptBytes: 256,
+                },
+              },
+            },
+          },
+        },
+        runOverrides: { sessionFile },
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      expect(calls).toHaveLength(2);
+      expect(calls[0]?.prompt).toContain("Pre-compaction memory flush.");
+      expect(calls[1]?.prompt).toBe("hello");
     });
   });
 

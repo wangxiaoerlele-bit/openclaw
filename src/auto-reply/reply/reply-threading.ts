@@ -1,4 +1,3 @@
-import { normalizeChatType } from "../../channels/chat-type.js";
 import { getChannelDock } from "../../channels/dock.js";
 import { normalizeChannelId } from "../../channels/plugins/index.js";
 import type { OpenClawConfig } from "../../config/config.js";
@@ -12,10 +11,6 @@ export function resolveReplyToMode(
   accountId?: string | null,
   chatType?: string | null,
 ): ReplyToMode {
-  if (normalizeChatType(chatType ?? undefined) === "direct") {
-    // DM policy: never use native reply/quote linkage.
-    return "off";
-  }
   const provider = normalizeChannelId(channel);
   if (!provider) {
     return "all";
@@ -58,22 +53,16 @@ export function createReplyToModeFilter(
 export function createReplyToModeFilterForChannel(
   mode: ReplyToMode,
   channel?: OriginatingChannelType,
-  opts: { chatType?: string | null } = {},
 ) {
   const provider = normalizeChannelId(channel);
   const normalized = typeof channel === "string" ? channel.trim().toLowerCase() : undefined;
   const isWebchat = normalized === "webchat";
-  const isDirect = normalizeChatType(opts.chatType ?? undefined) === "direct";
   // Default: allow explicit reply tags/directives even when replyToMode is "off".
   // Unknown channels fail closed; internal webchat stays allowed.
   const dock = provider ? getChannelDock(provider) : undefined;
-  const allowExplicitReplyTagsWhenOff = isDirect
-    ? false
-    : provider
-      ? (dock?.threading?.allowExplicitReplyTagsWhenOff ??
-        dock?.threading?.allowTagsWhenOff ??
-        true)
-      : isWebchat;
+  const allowExplicitReplyTagsWhenOff = provider
+    ? (dock?.threading?.allowExplicitReplyTagsWhenOff ?? dock?.threading?.allowTagsWhenOff ?? true)
+    : isWebchat;
   return createReplyToModeFilter(mode, {
     allowExplicitReplyTagsWhenOff,
   });

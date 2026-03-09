@@ -46,7 +46,7 @@ import {
 } from "./agent-runner-reminder-guard.js";
 import { appendUsageLine, formatResponseUsageLine } from "./agent-runner-utils.js";
 import { createAudioAsVoiceBuffer, createBlockReplyPipeline } from "./block-reply-pipeline.js";
-import { resolveBlockStreamingCoalescing } from "./block-streaming.js";
+import { resolveEffectiveBlockStreamingConfig } from "./block-streaming.js";
 import { applyExecutionTaskGuard } from "./execution-task-guard.js";
 import { createFollowupRunner } from "./followup-runner.js";
 import { resolveOriginMessageProvider, resolveOriginMessageTo } from "./origin-routing.js";
@@ -153,18 +153,16 @@ export async function runReplyAgent(params: {
     sessionCtx.AccountId,
     sessionCtx.ChatType,
   );
-  const applyReplyToMode = createReplyToModeFilterForChannel(replyToMode, replyToChannel, {
-    chatType: sessionCtx.ChatType,
-  });
+  const applyReplyToMode = createReplyToModeFilterForChannel(replyToMode, replyToChannel);
   const cfg = followupRun.run.config;
   const blockReplyCoalescing =
     blockStreamingEnabled && opts?.onBlockReply
-      ? resolveBlockStreamingCoalescing(
+      ? resolveEffectiveBlockStreamingConfig({
           cfg,
-          sessionCtx.Provider,
-          sessionCtx.AccountId,
-          blockReplyChunking,
-        )
+          provider: sessionCtx.Provider,
+          accountId: sessionCtx.AccountId,
+          chunking: blockReplyChunking,
+        }).coalescing
       : undefined;
   const blockReplyPipeline =
     blockStreamingEnabled && opts?.onBlockReply
@@ -224,6 +222,7 @@ export async function runReplyAgent(params: {
   activeSessionEntry = await runMemoryFlushIfNeeded({
     cfg,
     followupRun,
+    promptForEstimate: followupRun.prompt,
     sessionCtx,
     opts,
     defaultModel,
@@ -598,7 +597,7 @@ export async function runReplyAgent(params: {
         costConfig,
       });
       if (formatted && responseUsageMode === "full" && sessionKey) {
-        formatted = `${formatted} · session ${sessionKey}`;
+        formatted = `${formatted} · session \`${sessionKey}\``;
       }
       if (formatted) {
         responseUsageLine = formatted;
@@ -721,7 +720,7 @@ export async function runReplyAgent(params: {
     // or the reply path doesn't go through it cleanly, the second
     // signal never fires and the typing keepalive loop runs forever.
     // Calling this twice is harmless — cleanup() is guarded by the
-    // `active` flag. Same pattern as the followup runner fix.
+    // `active` flag.  Same pattern as the followup runner fix (#26881).
     typing.markDispatchIdle();
   }
 }

@@ -1,13 +1,8 @@
-import {
-  codingTools,
-  createEditTool,
-  createReadTool,
-  createWriteTool,
-  readTool,
-} from "@mariozechner/pi-coding-agent";
+import { codingTools, createReadTool, readTool } from "@mariozechner/pi-coding-agent";
 import type { OpenClawConfig } from "../config/config.js";
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
 import { resolveMergedSafeBinProfileFixtures } from "../infra/exec-safe-bin-runtime-policy.js";
+import { normalizePathPrepend } from "../infra/path-prepend.js";
 import { logWarn } from "../logger.js";
 import { getPluginToolMeta } from "../plugins/tools.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
@@ -34,7 +29,8 @@ import {
 } from "./pi-tools.policy.js";
 import {
   assertRequiredParams,
-  CLAUDE_PARAM_GROUPS,
+  createHostWorkspaceEditTool,
+  createHostWorkspaceWriteTool,
   createOpenClawReadTool,
   createSandboxedEditTool,
   createSandboxedReadTool,
@@ -48,6 +44,7 @@ import {
 import { cleanToolSchemaForGemini, normalizeToolParameters } from "./pi-tools.schema.js";
 import type { AnyAgentTool } from "./pi-tools.types.js";
 import type { SandboxContext } from "./sandbox.js";
+import { isXaiProvider } from "./schema/clean-for-xai.js";
 import { getSubagentDepthFromSessionStore } from "./subagent-depth.js";
 import { createToolFsPolicy, resolveToolFsConfig } from "./tool-fs-policy.js";
 import {
@@ -65,6 +62,44 @@ import { resolveWorkspaceRoot } from "./workspace-dir.js";
 function isOpenAIProvider(provider?: string) {
   const normalized = provider?.trim().toLowerCase();
   return normalized === "openai" || normalized === "openai-codex";
+}
+
+const TOOL_DENY_BY_MESSAGE_PROVIDER: Readonly<Record<string, readonly string[]>> = {
+  voice: ["tts"],
+};
+const TOOL_DENY_FOR_XAI_PROVIDERS = new Set(["web_search"]);
+
+function normalizeMessageProvider(messageProvider?: string): string | undefined {
+  const normalized = messageProvider?.trim().toLowerCase();
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+function applyMessageProviderToolPolicy(
+  tools: AnyAgentTool[],
+  messageProvider?: string,
+): AnyAgentTool[] {
+  const normalizedProvider = normalizeMessageProvider(messageProvider);
+  if (!normalizedProvider) {
+    return tools;
+  }
+  const deniedTools = TOOL_DENY_BY_MESSAGE_PROVIDER[normalizedProvider];
+  if (!deniedTools || deniedTools.length === 0) {
+    return tools;
+  }
+  const deniedSet = new Set(deniedTools);
+  return tools.filter((tool) => !deniedSet.has(tool.name));
+}
+
+function applyModelProviderToolPolicy(
+  tools: AnyAgentTool[],
+  params?: { modelProvider?: string; modelId?: string },
+): AnyAgentTool[] {
+  if (!isXaiProvider(params?.modelProvider, params?.modelId)) {
+    return tools;
+  }
+  // xAI/Grok providers expose a native web_search tool; sending OpenClaw's
+  // web_search alongside it causes duplicate-name request failures.
+  return tools.filter((tool) => !TOOL_DENY_FOR_XAI_PROVIDERS.has(tool.name));
 }
 
 function isApplyPatchAllowedForModel(params: {
@@ -157,17 +192,24 @@ export const __testing = {
   patchToolSchemaForClaudeCompatibility,
   wrapToolParamNormalization,
   assertRequiredParams,
+  applyModelProviderToolPolicy,
 } as const;
 
 export function createOpenClawCodingTools(options?: {
   agentId?: string;
   exec?: ExecToolDefaults & ProcessToolDefaults;
+  /** Additional PATH entries merged into exec defaults for this run. */
+  extraExecPathPrepend?: string[];
   messageProvider?: string;
   agentAccountId?: string;
   messageTo?: string;
   messageThreadId?: string | number;
   sandbox?: SandboxContext | null;
   sessionKey?: string;
+  /** Ephemeral session UUID — regenerated on /new and /reset. */
+  sessionId?: string;
+  /** Stable run identifier for this agent invocation. */
+  runId?: string;
   agentDir?: string;
   workspaceDir?: string;
   config?: OpenClawConfig;
@@ -339,34 +381,31 @@ export function createOpenClawCodingTools(options?: {
       if (sandboxRoot) {
         return [];
       }
-      // Wrap with param normalization for Claude Code compatibility
-      const wrapped = wrapToolParamNormalization(
-        createWriteTool(workspaceRoot),
-        CLAUDE_PARAM_GROUPS.write,
-      );
+      const wrapped = createHostWorkspaceWriteTool(workspaceRoot, { workspaceOnly });
       return [workspaceOnly ? wrapToolWorkspaceRootGuard(wrapped, workspaceRoot) : wrapped];
     }
     if (tool.name === "edit") {
       if (sandboxRoot) {
         return [];
       }
-      // Wrap with param normalization for Claude Code compatibility
-      const wrapped = wrapToolParamNormalization(
-        createEditTool(workspaceRoot),
-        CLAUDE_PARAM_GROUPS.edit,
-      );
+      const wrapped = createHostWorkspaceEditTool(workspaceRoot, { workspaceOnly });
       return [workspaceOnly ? wrapToolWorkspaceRootGuard(wrapped, workspaceRoot) : wrapped];
     }
     return [tool];
   });
   const { cleanupMs: cleanupMsOverride, ...execDefaults } = options?.exec ?? {};
+  const mergedExecPathPrepend = normalizePathPrepend([
+    ...(options?.exec?.pathPrepend ?? []),
+    ...(options?.extraExecPathPrepend ?? []),
+    ...(execConfig.pathPrepend ?? []),
+  ]);
   const execTool = createExecTool({
     ...execDefaults,
     host: options?.exec?.host ?? execConfig.host,
     security: options?.exec?.security ?? execConfig.security,
     ask: options?.exec?.ask ?? execConfig.ask,
     node: options?.exec?.node ?? execConfig.node,
-    pathPrepend: options?.exec?.pathPrepend ?? execConfig.pathPrepend,
+    pathPrepend: mergedExecPathPrepend,
     safeBins: options?.exec?.safeBins ?? execConfig.safeBins,
     safeBinTrustedDirs: options?.exec?.safeBinTrustedDirs ?? execConfig.safeBinTrustedDirs,
     safeBinProfiles: options?.exec?.safeBinProfiles ?? execConfig.safeBinProfiles,
@@ -376,6 +415,9 @@ export function createOpenClawCodingTools(options?: {
     scopeKey,
     sessionKey: options?.sessionKey,
     messageProvider: options?.messageProvider,
+    currentChannelId: options?.currentChannelId,
+    currentThreadTs: options?.currentThreadTs,
+    accountId: options?.agentAccountId,
     backgroundMs: options?.exec?.backgroundMs ?? execConfig.backgroundMs,
     timeoutSec: options?.exec?.timeoutSec ?? execConfig.timeoutSec,
     approvalRunningNoticeMs:
@@ -478,11 +520,17 @@ export function createOpenClawCodingTools(options?: {
       requesterAgentIdOverride: agentId,
       requesterSenderId: options?.senderId,
       senderIsOwner: options?.senderIsOwner,
+      sessionId: options?.sessionId,
     }),
   ];
+  const toolsForMessageProvider = applyMessageProviderToolPolicy(tools, options?.messageProvider);
+  const toolsForModelProvider = applyModelProviderToolPolicy(toolsForMessageProvider, {
+    modelProvider: options?.modelProvider,
+    modelId: options?.modelId,
+  });
   // Security: treat unknown/undefined as unauthorized (opt-in, not opt-out)
   const senderIsOwner = options?.senderIsOwner === true;
-  const toolsByAuthorization = applyOwnerOnlyToolPolicy(tools, senderIsOwner);
+  const toolsByAuthorization = applyOwnerOnlyToolPolicy(toolsForModelProvider, senderIsOwner);
   const subagentFiltered = applyToolPolicyPipeline({
     tools: toolsByAuthorization,
     toolMeta: (tool) => getPluginToolMeta(tool),
@@ -508,12 +556,17 @@ export function createOpenClawCodingTools(options?: {
   // Without this, some providers (notably OpenAI) will reject root-level union schemas.
   // Provider-specific cleaning: Gemini needs constraint keywords stripped, but Anthropic expects them.
   const normalized = subagentFiltered.map((tool) =>
-    normalizeToolParameters(tool, { modelProvider: options?.modelProvider }),
+    normalizeToolParameters(tool, {
+      modelProvider: options?.modelProvider,
+      modelId: options?.modelId,
+    }),
   );
   const withHooks = normalized.map((tool) =>
     wrapToolWithBeforeToolCallHook(tool, {
       agentId,
       sessionKey: options?.sessionKey,
+      sessionId: options?.sessionId,
+      runId: options?.runId,
       loopDetection: resolveToolLoopDetectionConfig({ cfg: options?.config, agentId }),
     }),
   );

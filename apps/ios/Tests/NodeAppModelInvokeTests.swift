@@ -2,32 +2,8 @@ import OpenClawKit
 import Foundation
 import Testing
 import UIKit
+import WebKit
 @testable import OpenClaw
-
-private func withUserDefaults<T>(_ updates: [String: Any?], _ body: () throws -> T) rethrows -> T {
-    let defaults = UserDefaults.standard
-    var snapshot: [String: Any?] = [:]
-    for key in updates.keys {
-        snapshot[key] = defaults.object(forKey: key)
-    }
-    for (key, value) in updates {
-        if let value {
-            defaults.set(value, forKey: key)
-        } else {
-            defaults.removeObject(forKey: key)
-        }
-    }
-    defer {
-        for (key, value) in snapshot {
-            if let value {
-                defaults.set(value, forKey: key)
-            } else {
-                defaults.removeObject(forKey: key)
-            }
-        }
-    }
-    return try body()
-}
 
 private func makeAgentDeepLinkURL(
     message: String,
@@ -91,6 +67,14 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
     func emitReply(_ event: WatchQuickReplyEvent) {
         self.replyHandler?(event)
     }
+}
+
+@MainActor
+private func mountNodeScreen(_ screen: ScreenController) throws -> (ScreenWebViewCoordinator, WKWebView) {
+    let coordinator = ScreenWebViewCoordinator(controller: screen)
+    _ = coordinator.makeContainerView()
+    let webView = try #require(coordinator.managedWebView)
+    return (coordinator, webView)
 }
 
 @Suite(.serialized) struct NodeAppModelInvokeTests {
@@ -171,6 +155,8 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
 
     @Test @MainActor func handleInvokeCanvasCommandsUpdateScreen() async throws {
         let appModel = NodeAppModel()
+        let (coordinator, _) = try mountNodeScreen(appModel.screen)
+        defer { coordinator.teardown() }
         appModel.screen.navigate(to: "http://example.com")
 
         let present = BridgeInvokeRequest(id: "present", command: OpenClawCanvasCommand.present.rawValue)
@@ -197,7 +183,12 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
             id: "eval",
             command: OpenClawCanvasCommand.evalJS.rawValue,
             paramsJSON: evalJSON)
-        let evalRes = await appModel._test_handleInvoke(eval)
+        let deadline = ContinuousClock().now.advanced(by: .seconds(3))
+        var evalRes = await appModel._test_handleInvoke(eval)
+        while !evalRes.ok, ContinuousClock().now < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            evalRes = await appModel._test_handleInvoke(eval)
+        }
         #expect(evalRes.ok == true)
         let payloadData = try #require(evalRes.payloadJSON?.data(using: .utf8))
         let payload = try JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
@@ -409,6 +400,10 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
                 note: nil,
                 sentAtMs: 1234,
                 transport: "transferUserInfo"))
+        let deadline = ContinuousClock().now.advanced(by: .seconds(1))
+        while appModel._test_queuedWatchReplyCount() == 0, ContinuousClock().now < deadline {
+            await Task.yield()
+        }
         #expect(appModel._test_queuedWatchReplyCount() == 1)
     }
 
@@ -439,6 +434,20 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
         await appModel.approvePendingAgentDeepLinkPrompt()
         #expect(appModel.pendingAgentDeepLinkPrompt == nil)
         #expect(appModel.openChatRequestID == 1)
+    }
+
+    @Test @MainActor func handleDeepLinkCoalescesPromptWhenRateLimited() async throws {
+        let appModel = NodeAppModel()
+        appModel._test_setGatewayConnected(true)
+
+        await appModel.handleDeepLink(url: makeAgentDeepLinkURL(message: "first prompt"))
+        let firstPrompt = try #require(appModel.pendingAgentDeepLinkPrompt)
+
+        await appModel.handleDeepLink(url: makeAgentDeepLinkURL(message: "second prompt"))
+        let coalescedPrompt = try #require(appModel.pendingAgentDeepLinkPrompt)
+
+        #expect(coalescedPrompt.id != firstPrompt.id)
+        #expect(coalescedPrompt.messagePreview.contains("second prompt"))
     }
 
     @Test @MainActor func handleDeepLinkStripsDeliveryFieldsWhenUnkeyed() async throws {

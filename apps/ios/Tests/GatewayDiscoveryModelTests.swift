@@ -1,6 +1,7 @@
 import Testing
 @testable import OpenClaw
 
+@MainActor
 @Suite(.serialized) struct GatewayDiscoveryModelTests {
     @Test @MainActor func debugLoggingCapturesLifecycleAndResets() {
         let model = GatewayDiscoveryModel()

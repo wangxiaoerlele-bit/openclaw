@@ -2,6 +2,10 @@ import Foundation
 import Security
 
 public enum GenericPasswordKeychainStore {
+    // iOS simulator/unit-test hosts can run without a working Keychain entitlement.
+    // Keep production on Security.framework, but provide a deterministic fallback for XCTest.
+    private static let testFallbackSuiteName = "ai.openclaw.tests.keychain-fallback"
+
     public static func loadString(service: String, account: String) -> String? {
         guard let data = self.loadData(service: service, account: account) else { return nil }
         return String(data: data, encoding: .utf8)
@@ -19,12 +23,19 @@ public enum GenericPasswordKeychainStore {
 
     @discardableResult
     public static func delete(service: String, account: String) -> Bool {
+        if self.useTestFallback {
+            self.testFallbackDefaults.removeObject(forKey: self.testFallbackKey(service: service, account: account))
+            return true
+        }
         let query = self.baseQuery(service: service, account: account)
         let status = SecItemDelete(query as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
     }
 
     private static func loadData(service: String, account: String) -> Data? {
+        if self.useTestFallback {
+            return self.testFallbackDefaults.data(forKey: self.testFallbackKey(service: service, account: account))
+        }
         var query = self.baseQuery(service: service, account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -42,6 +53,10 @@ public enum GenericPasswordKeychainStore {
         account: String,
         accessible: CFString
     ) -> Bool {
+        if self.useTestFallback {
+            self.testFallbackDefaults.set(data, forKey: self.testFallbackKey(service: service, account: account))
+            return true
+        }
         let query = self.baseQuery(service: service, account: account)
         let previousData = self.loadData(service: service, account: account)
 
@@ -73,5 +88,17 @@ public enum GenericPasswordKeychainStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
+    }
+
+    private static var useTestFallback: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
+
+    private static var testFallbackDefaults: UserDefaults {
+        UserDefaults(suiteName: self.testFallbackSuiteName) ?? .standard
+    }
+
+    private static func testFallbackKey(service: String, account: String) -> String {
+        "generic-password::\(service)::\(account)"
     }
 }

@@ -46,23 +46,15 @@ struct GatewayDiscoveryDebugLogView: View {
             .joined(separator: "\n")
     }
 
-    private static let timeFormatter: DateFormatter = {
+    private static func formatTime(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
-        return formatter
-    }()
-
-    private static let isoFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-
-    private static func formatTime(_ date: Date) -> String {
-        self.timeFormatter.string(from: date)
+        return formatter.string(from: date)
     }
 
     private static func formatISO(_ date: Date) -> String {
-        self.isoFormatter.string(from: date)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 }

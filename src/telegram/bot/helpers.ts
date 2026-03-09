@@ -1,13 +1,14 @@
 import type { Chat, Message, MessageOrigin, User } from "@grammyjs/types";
 import { formatLocationText, type NormalizedLocation } from "../../channels/location.js";
 import { resolveTelegramPreviewStreamMode } from "../../config/discord-preview-streaming.js";
-import type { TelegramGroupConfig, TelegramTopicConfig } from "../../config/types.js";
+import type {
+  TelegramDirectConfig,
+  TelegramGroupConfig,
+  TelegramTopicConfig,
+} from "../../config/types.js";
 import { readChannelAllowFromStore } from "../../pairing/pairing-store.js";
-import {
-  firstDefined,
-  normalizeAllowFromWithStore,
-  type NormalizedAllowFrom,
-} from "../bot-access.js";
+import { normalizeAccountId } from "../../routing/session-key.js";
+import { firstDefined, normalizeAllowFrom, type NormalizedAllowFrom } from "../bot-access.js";
 import type { TelegramStreamMode } from "./types.js";
 
 const TELEGRAM_GENERAL_TOPIC_ID = 1;
@@ -20,45 +21,52 @@ export type TelegramThreadSpec = {
 export async function resolveTelegramGroupAllowFromContext(params: {
   chatId: string | number;
   accountId?: string;
-  dmPolicy?: string;
+  isGroup?: boolean;
   isForum?: boolean;
   messageThreadId?: number | null;
   groupAllowFrom?: Array<string | number>;
   resolveTelegramGroupConfig: (
     chatId: string | number,
     messageThreadId?: number,
-  ) => { groupConfig?: TelegramGroupConfig; topicConfig?: TelegramTopicConfig };
+  ) => {
+    groupConfig?: TelegramGroupConfig | TelegramDirectConfig;
+    topicConfig?: TelegramTopicConfig;
+  };
 }): Promise<{
   resolvedThreadId?: number;
+  dmThreadId?: number;
   storeAllowFrom: string[];
-  groupConfig?: TelegramGroupConfig;
+  groupConfig?: TelegramGroupConfig | TelegramDirectConfig;
   topicConfig?: TelegramTopicConfig;
   groupAllowOverride?: Array<string | number>;
   effectiveGroupAllow: NormalizedAllowFrom;
   hasGroupAllowOverride: boolean;
 }> {
-  const resolvedThreadId = resolveTelegramForumThreadId({
+  const accountId = normalizeAccountId(params.accountId);
+  // Use resolveTelegramThreadSpec to handle both forum groups AND DM topics
+  const threadSpec = resolveTelegramThreadSpec({
+    isGroup: params.isGroup ?? false,
     isForum: params.isForum,
     messageThreadId: params.messageThreadId,
   });
-  const storeAllowFrom = await readChannelAllowFromStore(
-    "telegram",
-    process.env,
-    params.accountId,
-  ).catch(() => []);
+  const resolvedThreadId = threadSpec.scope === "forum" ? threadSpec.id : undefined;
+  const dmThreadId = threadSpec.scope === "dm" ? threadSpec.id : undefined;
+  const threadIdForConfig = resolvedThreadId ?? dmThreadId;
+  const storeAllowFrom = await readChannelAllowFromStore("telegram", process.env, accountId).catch(
+    () => [],
+  );
   const { groupConfig, topicConfig } = params.resolveTelegramGroupConfig(
     params.chatId,
-    resolvedThreadId,
+    threadIdForConfig,
   );
   const groupAllowOverride = firstDefined(topicConfig?.allowFrom, groupConfig?.allowFrom);
-  const effectiveGroupAllow = normalizeAllowFromWithStore({
-    allowFrom: groupAllowOverride ?? params.groupAllowFrom,
-    storeAllowFrom,
-    dmPolicy: params.dmPolicy,
-  });
+  // Group sender access must remain explicit (groupAllowFrom/per-group allowFrom only).
+  // DM pairing store entries are not a group authorization source.
+  const effectiveGroupAllow = normalizeAllowFrom(groupAllowOverride ?? params.groupAllowFrom);
   const hasGroupAllowOverride = typeof groupAllowOverride !== "undefined";
   return {
     resolvedThreadId,
+    dmThreadId,
     storeAllowFrom,
     groupConfig,
     topicConfig,
@@ -165,6 +173,46 @@ export function resolveTelegramStreamMode(telegramCfg?: {
 
 export function buildTelegramGroupPeerId(chatId: number | string, messageThreadId?: number) {
   return messageThreadId != null ? `${chatId}:topic:${messageThreadId}` : String(chatId);
+}
+
+/**
+ * Resolve the direct-message peer identifier for Telegram routing/session keys.
+ *
+ * In some Telegram DM deliveries (for example certain business/chat bridge flows),
+ * `chat.id` can differ from the actual sender user id. Prefer sender id when present
+ * so per-peer DM scopes isolate users correctly.
+ */
+export function resolveTelegramDirectPeerId(params: {
+  chatId: number | string;
+  senderId?: number | string | null;
+}) {
+  const senderId = params.senderId != null ? String(params.senderId).trim() : "";
+  if (senderId) {
+    return senderId;
+  }
+  return String(params.chatId);
+}
+
+/**
+ * Resolve the conversation peer id used for Telegram inbound routing.
+ *
+ * - Groups and forum topics route by chat id / topic id.
+ * - Direct messages prefer the sender id because Telegram business/bridge
+ *   deliveries can expose a chat id that differs from the actual user id.
+ */
+export function resolveTelegramRoutingPeerId(params: {
+  isGroup: boolean;
+  chatId: number | string;
+  resolvedThreadId?: number;
+  senderId?: number | string | null;
+}) {
+  if (params.isGroup) {
+    return buildTelegramGroupPeerId(params.chatId, params.resolvedThreadId);
+  }
+  return resolveTelegramDirectPeerId({
+    chatId: params.chatId,
+    senderId: params.senderId,
+  });
 }
 
 export function buildTelegramGroupFrom(chatId: number | string, messageThreadId?: number) {
@@ -325,12 +373,15 @@ export type TelegramReplyTarget = {
   forwardedFrom?: TelegramForwardedContext;
 };
 
+export function resolveTelegramReplyTargetMessage(msg: Message): Message | undefined {
+  return msg.reply_to_message ?? (msg as Message & { external_reply?: Message }).external_reply;
+}
+
 export function describeReplyTarget(msg: Message): TelegramReplyTarget | null {
-  const reply = msg.reply_to_message;
-  const externalReply = (msg as Message & { external_reply?: Message }).external_reply;
+  const replyLike = resolveTelegramReplyTargetMessage(msg);
   const quoteText =
     msg.quote?.text ??
-    (externalReply as (Message & { quote?: { text?: string } }) | undefined)?.quote?.text;
+    (replyLike as (Message & { quote?: { text?: string } }) | undefined)?.quote?.text;
   let body = "";
   let kind: TelegramReplyTarget["kind"] = "reply";
 
@@ -341,7 +392,6 @@ export function describeReplyTarget(msg: Message): TelegramReplyTarget | null {
     }
   }
 
-  const replyLike = reply ?? externalReply;
   if (!body && replyLike) {
     const replyBody = (replyLike.text ?? replyLike.caption ?? "").trim();
     body = replyBody;

@@ -5,7 +5,10 @@ import {
   describeReplyTarget,
   expandTextLinks,
   normalizeForwardedContext,
+  resolveTelegramDirectPeerId,
+  resolveTelegramReplyTargetMessage,
   resolveTelegramForumThreadId,
+  resolveTelegramRoutingPeerId,
 } from "./helpers.js";
 
 describe("resolveTelegramForumThreadId", () => {
@@ -50,6 +53,75 @@ describe("buildTypingThreadParams", () => {
     { input: 1, expected: { message_thread_id: 1 } },
   ])("builds typing params", ({ input, expected }) => {
     expect(buildTypingThreadParams(input)).toEqual(expected);
+  });
+});
+
+describe("resolveTelegramDirectPeerId", () => {
+  it("prefers sender id when available", () => {
+    expect(resolveTelegramDirectPeerId({ chatId: 777777777, senderId: 123456789 })).toBe(
+      "123456789",
+    );
+  });
+
+  it("falls back to chat id when sender id is missing", () => {
+    expect(resolveTelegramDirectPeerId({ chatId: 777777777, senderId: undefined })).toBe(
+      "777777777",
+    );
+  });
+});
+
+describe("resolveTelegramRoutingPeerId", () => {
+  it("uses sender id for direct messages when available", () => {
+    expect(
+      resolveTelegramRoutingPeerId({
+        isGroup: false,
+        chatId: 777777777,
+        senderId: 123456789,
+      }),
+    ).toBe("123456789");
+  });
+
+  it("falls back to chat id for direct messages without sender id", () => {
+    expect(
+      resolveTelegramRoutingPeerId({
+        isGroup: false,
+        chatId: 777777777,
+      }),
+    ).toBe("777777777");
+  });
+
+  it("uses topic-scoped chat ids for groups", () => {
+    expect(
+      resolveTelegramRoutingPeerId({
+        isGroup: true,
+        chatId: -1001234567890,
+        resolvedThreadId: 42,
+        senderId: 123456789,
+      }),
+    ).toBe("-1001234567890:topic:42");
+  });
+});
+
+describe("resolveTelegramReplyTargetMessage", () => {
+  it("prefers reply_to_message when present", () => {
+    const replyTarget = { message_id: 1, text: "reply" };
+    const externalReply = { message_id: 2, text: "external" };
+    expect(
+      resolveTelegramReplyTargetMessage(
+        // oxlint-disable-next-line typescript/no-explicit-any
+        { reply_to_message: replyTarget, external_reply: externalReply } as any,
+      ),
+    ).toBe(replyTarget);
+  });
+
+  it("falls back to external_reply", () => {
+    const externalReply = { message_id: 2, text: "external" };
+    expect(
+      resolveTelegramReplyTargetMessage(
+        // oxlint-disable-next-line typescript/no-explicit-any
+        { external_reply: externalReply } as any,
+      ),
+    ).toBe(externalReply);
   });
 });
 

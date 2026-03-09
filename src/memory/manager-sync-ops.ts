@@ -13,6 +13,7 @@ import { onSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { resolveUserPath } from "../utils.js";
 import { DEFAULT_GEMINI_EMBEDDING_MODEL } from "./embeddings-gemini.js";
 import { DEFAULT_MISTRAL_EMBEDDING_MODEL } from "./embeddings-mistral.js";
+import { DEFAULT_OLLAMA_EMBEDDING_MODEL } from "./embeddings-ollama.js";
 import { DEFAULT_OPENAI_EMBEDDING_MODEL } from "./embeddings-openai.js";
 import { DEFAULT_VOYAGE_EMBEDDING_MODEL } from "./embeddings-voyage.js";
 import {
@@ -20,6 +21,7 @@ import {
   type EmbeddingProvider,
   type GeminiEmbeddingClient,
   type MistralEmbeddingClient,
+  type OllamaEmbeddingClient,
   type OpenAiEmbeddingClient,
   type VoyageEmbeddingClient,
 } from "./embeddings.js";
@@ -41,7 +43,6 @@ import {
 } from "./session-files.js";
 import { loadSqliteVecExtension } from "./sqlite-vec.js";
 import { requireNodeSqlite } from "./sqlite.js";
-import { getTierDirectoryPaths, planTierMigration } from "./tiering.js";
 import type { MemorySource, MemorySyncProgressUpdate } from "./types.js";
 
 type MemoryIndexMeta = {
@@ -91,13 +92,13 @@ export abstract class MemoryManagerSyncOps {
   protected abstract readonly agentId: string;
   protected abstract readonly workspaceDir: string;
   protected abstract readonly settings: ResolvedMemorySearchConfig;
-  protected abstract readonly tiering: ResolvedMemorySearchConfig["tiering"];
   protected provider: EmbeddingProvider | null = null;
-  protected fallbackFrom?: "openai" | "local" | "gemini" | "voyage" | "mistral";
+  protected fallbackFrom?: "openai" | "local" | "gemini" | "voyage" | "mistral" | "ollama";
   protected openAi?: OpenAiEmbeddingClient;
   protected gemini?: GeminiEmbeddingClient;
   protected voyage?: VoyageEmbeddingClient;
   protected mistral?: MistralEmbeddingClient;
+  protected ollama?: OllamaEmbeddingClient;
   protected abstract batch: {
     enabled: boolean;
     wait: boolean;
@@ -135,6 +136,7 @@ export abstract class MemoryManagerSyncOps {
     string,
     { lastSize: number; pendingBytes: number; pendingMessages: number }
   >();
+  private lastMetaSerialized: string | null = null;
 
   protected abstract readonly cache: { enabled: boolean; maxEntries?: number };
   protected abstract db: DatabaseSync;
@@ -351,7 +353,10 @@ export abstract class MemoryManagerSyncOps {
     this.fts.available = result.ftsAvailable;
     if (result.ftsError) {
       this.fts.loadError = result.ftsError;
-      log.warn(`fts unavailable: ${result.ftsError}`);
+      // Only warn when hybrid search is enabled; otherwise this is expected noise.
+      if (this.fts.enabled) {
+        log.warn(`fts unavailable: ${result.ftsError}`);
+      }
     }
   }
 
@@ -594,112 +599,6 @@ export abstract class MemoryManagerSyncOps {
     }, ms);
   }
 
-  private async resolveUniqueTierTargetPath(targetPath: string): Promise<string> {
-    try {
-      await fs.access(targetPath, fsSync.constants.F_OK);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        return targetPath;
-      }
-      throw err;
-    }
-    const ext = path.extname(targetPath);
-    const base = ext ? targetPath.slice(0, -ext.length) : targetPath;
-    const unique = randomUUID().slice(0, 8);
-    return `${base}__${unique}${ext}`;
-  }
-
-  private async moveFileWithFallback(sourcePath: string, targetPath: string): Promise<void> {
-    try {
-      await fs.rename(sourcePath, targetPath);
-      return;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "EXDEV") {
-        throw err;
-      }
-    }
-    await fs.copyFile(sourcePath, targetPath);
-    await fs.rm(sourcePath, { force: true });
-  }
-
-  private async migrateMemoryFilesAcrossTiers(): Promise<number> {
-    if (!this.sources.has("memory") || !this.tiering.enabled || !this.tiering.autoMigrate) {
-      return 0;
-    }
-    const tierDirs = getTierDirectoryPaths(this.workspaceDir);
-    await Promise.all(
-      Object.values(tierDirs).map(async (dir) => await fs.mkdir(dir, { recursive: true })),
-    );
-
-    const files = await listMemoryFiles(this.workspaceDir);
-    if (files.length === 0) {
-      return 0;
-    }
-    let moved = 0;
-    const nowMs = Date.now();
-    for (const absPath of files) {
-      if (moved >= this.tiering.maxMovesPerSync) {
-        break;
-      }
-      const relPath = path.relative(this.workspaceDir, absPath).replace(/\\/g, "/");
-      const stat = await fs.stat(absPath).catch(() => null);
-      if (!stat) {
-        continue;
-      }
-      const plan = planTierMigration({
-        relPath,
-        mtimeMs: stat.mtimeMs,
-        nowMs,
-        config: this.tiering,
-      });
-      if (!plan) {
-        continue;
-      }
-      const targetPath = path.join(this.workspaceDir, plan.targetRelPath);
-      if (path.resolve(targetPath) === path.resolve(absPath)) {
-        continue;
-      }
-      const finalTarget = await this.resolveUniqueTierTargetPath(targetPath);
-      await fs.mkdir(path.dirname(finalTarget), { recursive: true });
-      await this.moveFileWithFallback(absPath, finalTarget);
-      moved += 1;
-      this.dirty = true;
-    }
-    if (moved > 0) {
-      log.debug("memory tier migration: moved files", {
-        moved,
-        maxMovesPerSync: this.tiering.maxMovesPerSync,
-      });
-    }
-    return moved;
-  }
-
-  private pruneOrphanChunks(): number {
-    const rows = this.db
-      .prepare(
-        "SELECT c.id FROM chunks c LEFT JOIN files f ON f.path = c.path AND f.source = c.source WHERE f.path IS NULL",
-      )
-      .all() as Array<{ id: string }>;
-    if (!rows.length) {
-      return 0;
-    }
-    for (const row of rows) {
-      this.db.prepare("DELETE FROM chunks WHERE id = ?").run(row.id);
-      if (this.fts.enabled && this.fts.available) {
-        try {
-          this.db.prepare(`DELETE FROM ${FTS_TABLE} WHERE id = ?`).run(row.id);
-        } catch {}
-      }
-      if (this.vector.enabled && this.vector.available) {
-        try {
-          this.db.prepare(`DELETE FROM ${VECTOR_TABLE} WHERE id = ?`).run(row.id);
-        } catch {}
-      }
-    }
-    return rows.length;
-  }
-
   private scheduleWatchSync() {
     if (!this.sources.has("memory") || !this.settings.sync.watch) {
       return;
@@ -739,6 +638,12 @@ export abstract class MemoryManagerSyncOps {
     needsFullReindex: boolean;
     progress?: MemorySyncProgressState;
   }) {
+    // FTS-only mode: skip embedding sync (no provider)
+    if (!this.provider) {
+      log.debug("Skipping memory file sync in FTS-only mode (no embedding provider)");
+      return;
+    }
+
     const files = await listMemoryFiles(this.workspaceDir, this.settings.extraPaths);
     const fileEntries = (
       await Promise.all(files.map(async (file) => buildFileEntry(file, this.workspaceDir)))
@@ -803,8 +708,8 @@ export abstract class MemoryManagerSyncOps {
       if (this.fts.enabled && this.fts.available) {
         try {
           this.db
-            .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ?`)
-            .run(stale.path, "memory");
+            .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ? AND model = ?`)
+            .run(stale.path, "memory", this.provider.model);
         } catch {}
       }
     }
@@ -814,6 +719,12 @@ export abstract class MemoryManagerSyncOps {
     needsFullReindex: boolean;
     progress?: MemorySyncProgressState;
   }) {
+    // FTS-only mode: skip embedding sync (no provider)
+    if (!this.provider) {
+      log.debug("Skipping session file sync in FTS-only mode (no embedding provider)");
+      return;
+    }
+
     const files = await listSessionFilesForAgent(this.agentId);
     const activePaths = new Set(files.map((file) => sessionPathForFile(file)));
     const indexAll = params.needsFullReindex || this.sessionsDirtyFiles.size === 0;
@@ -905,7 +816,7 @@ export abstract class MemoryManagerSyncOps {
         try {
           this.db
             .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ? AND model = ?`)
-            .run(stale.path, "sessions", this.provider?.model ?? "fts-only");
+            .run(stale.path, "sessions", this.provider.model);
         } catch {}
       }
     }
@@ -941,7 +852,6 @@ export abstract class MemoryManagerSyncOps {
     force?: boolean;
     progress?: (update: MemorySyncProgressUpdate) => void;
   }) {
-    await this.migrateMemoryFilesAcrossTiers();
     const progress = params?.progress ? this.createSyncProgress(params.progress) : undefined;
     if (progress) {
       progress.report({
@@ -1002,10 +912,6 @@ export abstract class MemoryManagerSyncOps {
       } else {
         this.sessionsDirty = false;
       }
-      const prunedOrphans = this.pruneOrphanChunks();
-      if (prunedOrphans > 0) {
-        log.debug("memory sync: pruned orphan chunks", { chunks: prunedOrphans });
-      }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       const activated =
@@ -1058,7 +964,13 @@ export abstract class MemoryManagerSyncOps {
     if (this.fallbackFrom) {
       return false;
     }
-    const fallbackFrom = this.provider.id as "openai" | "gemini" | "local" | "voyage" | "mistral";
+    const fallbackFrom = this.provider.id as
+      | "openai"
+      | "gemini"
+      | "local"
+      | "voyage"
+      | "mistral"
+      | "ollama";
 
     const fallbackModel =
       fallback === "gemini"
@@ -1069,7 +981,9 @@ export abstract class MemoryManagerSyncOps {
             ? DEFAULT_VOYAGE_EMBEDDING_MODEL
             : fallback === "mistral"
               ? DEFAULT_MISTRAL_EMBEDDING_MODEL
-              : this.settings.model;
+              : fallback === "ollama"
+                ? DEFAULT_OLLAMA_EMBEDDING_MODEL
+                : this.settings.model;
 
     const fallbackResult = await createEmbeddingProvider({
       config: this.cfg,
@@ -1088,6 +1002,7 @@ export abstract class MemoryManagerSyncOps {
     this.gemini = fallbackResult.gemini;
     this.voyage = fallbackResult.voyage;
     this.mistral = fallbackResult.mistral;
+    this.ollama = fallbackResult.ollama;
     this.providerKey = this.computeProviderKey();
     this.batch = this.resolveBatchConfig();
     log.warn(`memory embeddings: switched to fallback provider (${fallback})`, { reason });
@@ -1267,22 +1182,30 @@ export abstract class MemoryManagerSyncOps {
       | { value: string }
       | undefined;
     if (!row?.value) {
+      this.lastMetaSerialized = null;
       return null;
     }
     try {
-      return JSON.parse(row.value) as MemoryIndexMeta;
+      const parsed = JSON.parse(row.value) as MemoryIndexMeta;
+      this.lastMetaSerialized = row.value;
+      return parsed;
     } catch {
+      this.lastMetaSerialized = null;
       return null;
     }
   }
 
   protected writeMeta(meta: MemoryIndexMeta) {
     const value = JSON.stringify(meta);
+    if (this.lastMetaSerialized === value) {
+      return;
+    }
     this.db
       .prepare(
         `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
       )
       .run(META_KEY, value);
+    this.lastMetaSerialized = value;
   }
 
   private resolveConfiguredSourcesForMeta(): MemorySource[] {

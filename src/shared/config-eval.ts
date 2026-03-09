@@ -138,8 +138,8 @@ export function resolveRuntimePlatform(): string {
   return process.platform;
 }
 
-function windowsPathExtensions(): string[] {
-  const raw = process.env.PATHEXT;
+function windowsPathExtensionsFrom(pathExt: string | undefined): string[] {
+  const raw = pathExt;
   const list =
     raw !== undefined ? raw.split(";").map((v) => v.trim()) : [".EXE", ".CMD", ".BAT", ".COM"];
   return ["", ...list.filter(Boolean)];
@@ -148,6 +148,23 @@ function windowsPathExtensions(): string[] {
 let cachedHasBinaryPath: string | undefined;
 let cachedHasBinaryPathExt: string | undefined;
 const hasBinaryCache = new Map<string, boolean>();
+
+export function hasBinaryInPath(bin: string, pathEnv: string, pathExt?: string): boolean {
+  const parts = pathEnv.split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === "win32" ? windowsPathExtensionsFrom(pathExt) : [""];
+  for (const part of parts) {
+    for (const ext of extensions) {
+      const candidate = path.join(part, bin + ext);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return true;
+      } catch {
+        // keep scanning
+      }
+    }
+  }
+  return false;
+}
 
 export function hasBinary(bin: string): boolean {
   const pathEnv = process.env.PATH ?? "";
@@ -161,20 +178,7 @@ export function hasBinary(bin: string): boolean {
     return hasBinaryCache.get(bin)!;
   }
 
-  const parts = pathEnv.split(path.delimiter).filter(Boolean);
-  const extensions = process.platform === "win32" ? windowsPathExtensions() : [""];
-  for (const part of parts) {
-    for (const ext of extensions) {
-      const candidate = path.join(part, bin + ext);
-      try {
-        fs.accessSync(candidate, fs.constants.X_OK);
-        hasBinaryCache.set(bin, true);
-        return true;
-      } catch {
-        // keep scanning
-      }
-    }
-  }
-  hasBinaryCache.set(bin, false);
-  return false;
+  const found = hasBinaryInPath(bin, pathEnv, pathExt);
+  hasBinaryCache.set(bin, found);
+  return found;
 }

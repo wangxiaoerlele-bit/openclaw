@@ -13,6 +13,15 @@ export default defineConfig({
   test: {
     ...baseTest,
     include,
-    exclude: [...exclude, "src/gateway/**", "extensions/**"],
+    exclude: [
+      ...exclude,
+      "src/gateway/**",
+      "extensions/**",
+      "src/telegram/**",
+      "src/discord/**",
+      "src/web/**",
+      "src/browser/**",
+      "src/line/**",
+    ],
   },
 });

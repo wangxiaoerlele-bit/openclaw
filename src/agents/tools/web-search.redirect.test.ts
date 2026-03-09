@@ -5,14 +5,20 @@ const { fetchWithSsrFGuardMock } = vi.hoisted(() => ({
 }));
 
 vi.mock("../../infra/net/fetch-guard.js", () => ({
+  withStrictGuardedFetchMode: (params: Record<string, unknown>) => ({
+    ...params,
+    mode: "strict",
+  }),
+  withTrustedEnvProxyGuardedFetchMode: (params: Record<string, unknown>) => ({
+    ...params,
+    mode: "trusted_env_proxy",
+  }),
   fetchWithSsrFGuard: fetchWithSsrFGuardMock,
 }));
 
-import { __testing } from "./web-search.js";
+import { resolveCitationRedirectUrl } from "./web-search-citation-redirect.js";
 
 describe("web_search redirect resolution hardening", () => {
-  const { resolveRedirectUrl } = __testing;
-
   beforeEach(() => {
     fetchWithSsrFGuardMock.mockReset();
   });
@@ -25,22 +31,24 @@ describe("web_search redirect resolution hardening", () => {
       release,
     });
 
-    const resolved = await resolveRedirectUrl("https://example.com/start");
+    const resolved = await resolveCitationRedirectUrl("https://example.com/start");
     expect(resolved).toBe("https://example.com/final");
     expect(fetchWithSsrFGuardMock).toHaveBeenCalledWith(
       expect.objectContaining({
         url: "https://example.com/start",
         timeoutMs: 5000,
         init: { method: "HEAD" },
-        policy: { dangerouslyAllowPrivateNetwork: true },
+        mode: "strict",
       }),
     );
+    expect(fetchWithSsrFGuardMock.mock.calls[0]?.[0]?.proxy).toBeUndefined();
+    expect(fetchWithSsrFGuardMock.mock.calls[0]?.[0]?.policy).toBeUndefined();
     expect(release).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to the original URL when guarded resolution fails", async () => {
     fetchWithSsrFGuardMock.mockRejectedValue(new Error("blocked"));
-    await expect(resolveRedirectUrl("https://example.com/start")).resolves.toBe(
+    await expect(resolveCitationRedirectUrl("https://example.com/start")).resolves.toBe(
       "https://example.com/start",
     );
   });

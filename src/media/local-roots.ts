@@ -25,8 +25,6 @@ function buildMediaLocalRoots(
   const preferredTmpDir = options.preferredTmpDir ?? resolveCachedPreferredTmpDir();
   return [
     preferredTmpDir,
-    resolvedStateDir, // Add state dir root for screenshot access
-    path.join(resolvedStateDir, "memory"), // Include memory index + tier storage roots
     path.join(resolvedStateDir, "media"),
     path.join(resolvedStateDir, "agents"),
     path.join(resolvedStateDir, "workspace"),
@@ -53,16 +51,6 @@ export function getAgentScopedMediaLocalRoots(
   const normalizedWorkspaceDir = path.resolve(workspaceDir);
   if (!roots.includes(normalizedWorkspaceDir)) {
     roots.push(normalizedWorkspaceDir);
-  }
-  const workspaceMemoryDir = path.join(normalizedWorkspaceDir, "memory");
-  if (!roots.includes(workspaceMemoryDir)) {
-    roots.push(workspaceMemoryDir);
-  }
-  for (const tier of ["hot", "warm", "cold"] as const) {
-    const tierDir = path.join(workspaceMemoryDir, tier);
-    if (!roots.includes(tierDir)) {
-      roots.push(tierDir);
-    }
   }
   return roots;
 }

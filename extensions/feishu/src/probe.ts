@@ -1,85 +1,193 @@
+import { raceWithTimeoutAndAbort } from "./async.js";
 import { createFeishuClient, type FeishuClientCredentials } from "./client.js";
 import type { FeishuProbeResult } from "./types.js";
 
-// Cache bot info for 24 hours to reduce API calls
-const BOT_INFO_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const botInfoCache = new Map<string, { result: FeishuProbeResult; cachedAt: number }>();
+/** Cache probe results to reduce repeated health-check calls.
+ * Gateway health checks call probeFeishu() every minute; without caching this
+ * burns ~43,200 calls/month, easily exceeding Feishu's free-tier quota.
+ * Successful bot info is effectively static, while failures are cached briefly
+ * to avoid hammering the API during transient outages. */
+const probeCache = new Map<string, { result: FeishuProbeResult; expiresAt: number }>();
+const PROBE_SUCCESS_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const PROBE_ERROR_TTL_MS = 60 * 1000; // 1 minute
+const MAX_PROBE_CACHE_SIZE = 64;
+export const FEISHU_PROBE_REQUEST_TIMEOUT_MS = 10_000;
+export type ProbeFeishuOptions = {
+  timeoutMs?: number;
+  abortSignal?: AbortSignal;
+};
 
-export async function probeFeishu(creds?: FeishuClientCredentials): Promise<FeishuProbeResult> {
+type FeishuBotInfoResponse = {
+  code: number;
+  msg?: string;
+  bot?: { bot_name?: string; open_id?: string };
+  data?: { bot?: { bot_name?: string; open_id?: string } };
+};
+
+function linkAbortSignal(
+  sourceSignal: AbortSignal | undefined,
+  targetController: AbortController,
+): () => void {
+  if (!sourceSignal) {
+    return () => {};
+  }
+
+  const abortTarget = () => targetController.abort(sourceSignal.reason);
+  if (sourceSignal.aborted) {
+    abortTarget();
+    return () => {};
+  }
+
+  sourceSignal.addEventListener("abort", abortTarget, { once: true });
+  return () => sourceSignal.removeEventListener("abort", abortTarget);
+}
+
+function setCachedProbeResult(
+  cacheKey: string,
+  result: FeishuProbeResult,
+  ttlMs: number,
+): FeishuProbeResult {
+  probeCache.set(cacheKey, { result, expiresAt: Date.now() + ttlMs });
+  if (probeCache.size > MAX_PROBE_CACHE_SIZE) {
+    const oldest = probeCache.keys().next().value;
+    if (oldest !== undefined) {
+      probeCache.delete(oldest);
+    }
+  }
+  return result;
+}
+
+export async function probeFeishu(
+  creds?: FeishuClientCredentials,
+  options: ProbeFeishuOptions = {},
+): Promise<FeishuProbeResult> {
   if (!creds?.appId || !creds?.appSecret) {
     return {
       ok: false,
       error: "missing credentials (appId, appSecret)",
     };
   }
+  if (options.abortSignal?.aborted) {
+    return {
+      ok: false,
+      appId: creds.appId,
+      error: "probe aborted",
+    };
+  }
 
-  const cacheKey = creds.appId;
-  const now = Date.now();
+  const timeoutMs = options.timeoutMs ?? FEISHU_PROBE_REQUEST_TIMEOUT_MS;
 
-  // Check cache first
-  const cached = botInfoCache.get(cacheKey);
-  if (cached && now - cached.cachedAt < BOT_INFO_CACHE_TTL_MS) {
+  // Return cached result if still valid.
+  // Use accountId when available; otherwise include appSecret prefix so two
+  // accounts sharing the same appId (e.g. after secret rotation) don't
+  // pollute each other's cache entry.
+  const cacheKey = creds.accountId ?? `${creds.appId}:${creds.appSecret.slice(0, 8)}`;
+  const cached = probeCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
     return cached.result;
   }
 
   try {
     const client = createFeishuClient(creds);
+    const requestAbortController = new AbortController();
+    const unlinkAbortSignal = linkAbortSignal(options.abortSignal, requestAbortController);
     // Use bot/v3/info API to get bot information
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK generic request method
-    const response = await (client as any).request({
+    const requestPromise = (client as any).request({
       method: "GET",
       url: "/open-apis/bot/v3/info",
       data: {},
+      timeout: timeoutMs,
+      signal: requestAbortController.signal,
+    }) as Promise<FeishuBotInfoResponse>;
+    // If the outer timeout wins, the request rejects later from abort().
+    // Attach a handler now so that late cancellation does not become unhandled.
+    void requestPromise.catch(() => {});
+    const responseResult = await raceWithTimeoutAndAbort<FeishuBotInfoResponse>(requestPromise, {
+      timeoutMs,
+      abortSignal: options.abortSignal,
+    }).finally(() => {
+      unlinkAbortSignal();
     });
 
-    if (response.code !== 0) {
+    if (responseResult.status === "aborted") {
+      if (!requestAbortController.signal.aborted) {
+        requestAbortController.abort(options.abortSignal?.reason);
+      }
       return {
         ok: false,
         appId: creds.appId,
-        error: `API error: ${response.msg || `code ${response.code}`}`,
+        error: "probe aborted",
+      };
+    }
+    if (responseResult.status === "timeout") {
+      if (!requestAbortController.signal.aborted) {
+        requestAbortController.abort(new Error(`probe timed out after ${timeoutMs}ms`));
+      }
+      return setCachedProbeResult(
+        cacheKey,
+        {
+          ok: false,
+          appId: creds.appId,
+          error: `probe timed out after ${timeoutMs}ms`,
+        },
+        PROBE_ERROR_TTL_MS,
+      );
+    }
+
+    const response = responseResult.value;
+    if (options.abortSignal?.aborted) {
+      return {
+        ok: false,
+        appId: creds.appId,
+        error: "probe aborted",
       };
     }
 
+    if (response.code !== 0) {
+      return setCachedProbeResult(
+        cacheKey,
+        {
+          ok: false,
+          appId: creds.appId,
+          error: `API error: ${response.msg || `code ${response.code}`}`,
+        },
+        PROBE_ERROR_TTL_MS,
+      );
+    }
+
     const bot = response.bot || response.data?.bot;
-    const result: FeishuProbeResult = {
-      ok: true,
-      appId: creds.appId,
-      botName: bot?.bot_name,
-      botOpenId: bot?.open_id,
-    };
-    // Cache successful result
-    botInfoCache.set(cacheKey, { result, cachedAt: now });
-    return result;
+    return setCachedProbeResult(
+      cacheKey,
+      {
+        ok: true,
+        appId: creds.appId,
+        botName: bot?.bot_name,
+        botOpenId: bot?.open_id,
+      },
+      PROBE_SUCCESS_TTL_MS,
+    );
   } catch (err) {
-    return {
-      ok: false,
-      appId: creds.appId,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    if (options.abortSignal?.aborted) {
+      return {
+        ok: false,
+        appId: creds.appId,
+        error: "probe aborted",
+      };
+    }
+    return setCachedProbeResult(
+      cacheKey,
+      {
+        ok: false,
+        appId: creds.appId,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      PROBE_ERROR_TTL_MS,
+    );
   }
 }
 
-/**
- * Clear the bot info cache for a specific app or all apps.
- * Useful when quota is exhausted and you want to retry after reset.
- */
-export function clearBotInfoCache(appId?: string): void {
-  if (appId) {
-    botInfoCache.delete(appId);
-  } else {
-    botInfoCache.clear();
-  }
-}
-
-/**
- * Manually set the bot open_id to bypass API calls.
- * Useful when API quota is exhausted.
- */
-export function setBotOpenIdCache(appId: string, botOpenId: string): void {
-  const result: FeishuProbeResult = {
-    ok: true,
-    appId,
-    botOpenId,
-  };
-  botInfoCache.set(appId, { result, cachedAt: Date.now() });
+/** Clear the probe cache (for testing). */
+export function clearProbeCache(): void {
+  probeCache.clear();
 }

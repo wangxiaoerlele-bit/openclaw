@@ -1,6 +1,5 @@
 import { Type } from "@sinclair/typebox";
 import type { OpenClawConfig } from "../../config/config.js";
-import { fetchWithSsrFGuard } from "../../infra/net/fetch-guard.js";
 import { SsrFBlockedError } from "../../infra/net/ssrf.js";
 import { logDebug } from "../../logger.js";
 import { wrapExternalContent, wrapWebContent } from "../../security/external-content.js";
@@ -15,12 +14,7 @@ import {
   truncateText,
   type ExtractMode,
 } from "./web-fetch-utils.js";
-import {
-  extractWeixinArticleFromHtml,
-  fetchWeixinArticleViaBrowser,
-  isWeixinArticleUrl,
-  type WeixinExtractedArticle,
-} from "./web-fetch-weixin.js";
+import { fetchWithWebToolsNetworkGuard } from "./web-guarded-fetch.js";
 import {
   CacheEntry,
   DEFAULT_CACHE_TTL_MINUTES,
@@ -345,46 +339,6 @@ function buildFirecrawlWebFetchPayload(params: {
   };
 }
 
-function buildWeixinWebFetchPayload(params: {
-  weixin: WeixinExtractedArticle;
-  rawUrl: string;
-  finalUrlFallback: string;
-  statusFallback: number;
-  extractMode: ExtractMode;
-  maxChars: number;
-  tookMs: number;
-}): Record<string, unknown> {
-  const wrapped = wrapWebFetchContent(params.weixin.text, params.maxChars);
-  const wrappedTitle = params.weixin.title ? wrapWebFetchField(params.weixin.title) : undefined;
-  const wrappedAuthor = params.weixin.author ? wrapWebFetchField(params.weixin.author) : undefined;
-  const wrappedPublishTime = params.weixin.publishTime
-    ? wrapWebFetchField(params.weixin.publishTime)
-    : undefined;
-  return {
-    url: params.rawUrl, // Keep raw for tool chaining
-    finalUrl: params.weixin.finalUrl || params.finalUrlFallback, // Keep raw
-    status: params.statusFallback,
-    contentType: "text/markdown", // Protocol metadata, don't wrap
-    title: wrappedTitle,
-    author: wrappedAuthor,
-    publishTime: wrappedPublishTime,
-    extractMode: params.extractMode,
-    extractor: params.weixin.extractor,
-    externalContent: {
-      untrusted: true,
-      source: "web_fetch",
-      wrapped: true,
-    },
-    truncated: wrapped.truncated,
-    length: wrapped.wrappedLength,
-    rawLength: wrapped.rawLength, // Actual content length, not wrapped
-    wrappedLength: wrapped.wrappedLength,
-    fetchedAt: new Date().toISOString(),
-    tookMs: params.tookMs,
-    text: wrapped.text,
-  };
-}
-
 function normalizeContentType(value: string | null | undefined): string | undefined {
   if (!value) {
     return undefined;
@@ -545,39 +499,6 @@ async function maybeFetchFirecrawlWebFetchPayload(
   return payload;
 }
 
-async function maybeFetchWeixinBrowserWebFetchPayload(
-  params: WebFetchRuntimeParams & {
-    urlToFetch: string;
-    finalUrlFallback: string;
-    statusFallback: number;
-    cacheKey: string;
-    tookMs: number;
-  },
-): Promise<Record<string, unknown> | null> {
-  if (!isWeixinArticleUrl(params.url) && !isWeixinArticleUrl(params.urlToFetch)) {
-    return null;
-  }
-  const weixin = await fetchWeixinArticleViaBrowser({
-    url: params.urlToFetch,
-    extractMode: params.extractMode,
-    timeoutMs: params.timeoutSeconds * 1000,
-  });
-  if (!weixin) {
-    return null;
-  }
-  const payload = buildWeixinWebFetchPayload({
-    weixin,
-    rawUrl: params.url,
-    finalUrlFallback: params.finalUrlFallback,
-    statusFallback: params.statusFallback,
-    extractMode: params.extractMode,
-    maxChars: params.maxChars,
-    tookMs: params.tookMs,
-  });
-  writeCache(FETCH_CACHE, params.cacheKey, payload, params.cacheTtlMs);
-  return payload;
-}
-
 async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string, unknown>> {
   const cacheKey = normalizeCacheKey(
     `fetch:${params.url}:${params.extractMode}:${params.maxChars}`,
@@ -602,10 +523,10 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
   let release: (() => Promise<void>) | null = null;
   let finalUrl = params.url;
   try {
-    const result = await fetchWithSsrFGuard({
+    const result = await fetchWithWebToolsNetworkGuard({
       url: params.url,
       maxRedirects: params.maxRedirects,
-      timeoutMs: params.timeoutSeconds * 1000,
+      timeoutSeconds: params.timeoutSeconds,
       init: {
         headers: {
           Accept: "text/markdown, text/html;q=0.9, */*;q=0.1",
@@ -629,17 +550,6 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
     if (error instanceof SsrFBlockedError) {
       throw error;
     }
-    const weixinPayload = await maybeFetchWeixinBrowserWebFetchPayload({
-      ...params,
-      urlToFetch: finalUrl,
-      finalUrlFallback: finalUrl,
-      statusFallback: 200,
-      cacheKey,
-      tookMs: Date.now() - start,
-    });
-    if (weixinPayload) {
-      return weixinPayload;
-    }
     const payload = await maybeFetchFirecrawlWebFetchPayload({
       ...params,
       urlToFetch: finalUrl,
@@ -656,17 +566,6 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
 
   try {
     if (!res.ok) {
-      const weixinPayload = await maybeFetchWeixinBrowserWebFetchPayload({
-        ...params,
-        urlToFetch: finalUrl,
-        finalUrlFallback: finalUrl,
-        statusFallback: res.status,
-        cacheKey,
-        tookMs: Date.now() - start,
-      });
-      if (weixinPayload) {
-        return weixinPayload;
-      }
       const payload = await maybeFetchFirecrawlWebFetchPayload({
         ...params,
         urlToFetch: params.url,
@@ -698,8 +597,6 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
       : undefined;
 
     let title: string | undefined;
-    let author: string | undefined;
-    let publishTime: string | undefined;
     let extractor = "raw";
     let text = body;
     if (contentType.includes("text/markdown")) {
@@ -709,21 +606,7 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
         text = markdownToText(body);
       }
     } else if (contentType.includes("text/html")) {
-      const weixinHtml =
-        isWeixinArticleUrl(params.url) || isWeixinArticleUrl(finalUrl)
-          ? extractWeixinArticleFromHtml({
-              html: body,
-              url: finalUrl,
-              extractMode: params.extractMode,
-            })
-          : null;
-      if (weixinHtml?.text) {
-        text = weixinHtml.text;
-        title = weixinHtml.title;
-        author = weixinHtml.author;
-        publishTime = weixinHtml.publishTime;
-        extractor = weixinHtml.extractor;
-      } else if (params.readabilityEnabled) {
+      if (params.readabilityEnabled) {
         const readable = await extractReadableContent({
           html: body,
           url: finalUrl,
@@ -734,49 +617,21 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
           title = readable.title;
           extractor = "readability";
         } else {
-          const weixinBrowser = await maybeFetchWeixinArticleFallback({
-            inputUrl: params.url,
-            finalUrl,
-            extractMode: params.extractMode,
-            timeoutSeconds: params.timeoutSeconds,
-          });
-          if (weixinBrowser) {
-            text = weixinBrowser.text;
-            title = weixinBrowser.title;
-            author = weixinBrowser.author;
-            publishTime = weixinBrowser.publishTime;
-            extractor = weixinBrowser.extractor;
+          const firecrawl = await tryFirecrawlFallback({ ...params, url: finalUrl });
+          if (firecrawl) {
+            text = firecrawl.text;
+            title = firecrawl.title;
+            extractor = "firecrawl";
           } else {
-            const firecrawl = await tryFirecrawlFallback({ ...params, url: finalUrl });
-            if (firecrawl) {
-              text = firecrawl.text;
-              title = firecrawl.title;
-              extractor = "firecrawl";
-            } else {
-              throw new Error(
-                "Web fetch extraction failed: Readability and Firecrawl returned no content.",
-              );
-            }
+            throw new Error(
+              "Web fetch extraction failed: Readability and Firecrawl returned no content.",
+            );
           }
         }
       } else {
-        const weixinBrowser = await maybeFetchWeixinArticleFallback({
-          inputUrl: params.url,
-          finalUrl,
-          extractMode: params.extractMode,
-          timeoutSeconds: params.timeoutSeconds,
-        });
-        if (weixinBrowser) {
-          text = weixinBrowser.text;
-          title = weixinBrowser.title;
-          author = weixinBrowser.author;
-          publishTime = weixinBrowser.publishTime;
-          extractor = weixinBrowser.extractor;
-        } else {
-          throw new Error(
-            "Web fetch extraction failed: Readability disabled and Firecrawl unavailable.",
-          );
-        }
+        throw new Error(
+          "Web fetch extraction failed: Readability disabled and Firecrawl unavailable.",
+        );
       }
     } else if (contentType.includes("application/json")) {
       try {
@@ -790,8 +645,6 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
 
     const wrapped = wrapWebFetchContent(text, params.maxChars);
     const wrappedTitle = title ? wrapWebFetchField(title) : undefined;
-    const wrappedAuthor = author ? wrapWebFetchField(author) : undefined;
-    const wrappedPublishTime = publishTime ? wrapWebFetchField(publishTime) : undefined;
     const wrappedWarning = wrapWebFetchField(responseTruncatedWarning);
     const payload = {
       url: params.url, // Keep raw for tool chaining
@@ -799,8 +652,6 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
       status: res.status,
       contentType: normalizedContentType, // Protocol metadata, don't wrap
       title: wrappedTitle,
-      author: wrappedAuthor,
-      publishTime: wrappedPublishTime,
       extractMode: params.extractMode,
       extractor,
       externalContent: {
@@ -824,22 +675,6 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
       await release();
     }
   }
-}
-
-async function maybeFetchWeixinArticleFallback(params: {
-  inputUrl: string;
-  finalUrl: string;
-  extractMode: ExtractMode;
-  timeoutSeconds: number;
-}): Promise<WeixinExtractedArticle | null> {
-  if (!isWeixinArticleUrl(params.inputUrl) && !isWeixinArticleUrl(params.finalUrl)) {
-    return null;
-  }
-  return await fetchWeixinArticleViaBrowser({
-    url: params.finalUrl,
-    extractMode: params.extractMode,
-    timeoutMs: params.timeoutSeconds * 1000,
-  });
 }
 
 async function tryFirecrawlFallback(

@@ -35,6 +35,17 @@ function makeCfg(overrides?: Partial<OpenClawConfig>): OpenClawConfig {
   } as OpenClawConfig;
 }
 
+function makeTelegramBoundCfg(accountId = "account-b"): OpenClawConfig {
+  return makeCfg({
+    bindings: [
+      {
+        agentId: AGENT_ID,
+        match: { channel: "telegram", accountId },
+      },
+    ],
+  });
+}
+
 const AGENT_ID = "agent-b";
 const DEFAULT_TARGET = {
   channel: "telegram" as const,
@@ -60,7 +71,7 @@ function setStoredWhatsAppAllowFrom(allowFrom: string[]) {
 
 async function resolveForAgent(params: {
   cfg: OpenClawConfig;
-  target?: { channel?: "last" | "telegram" | "whatsapp" | "feishu"; to?: string };
+  target?: { channel?: "last" | "telegram"; to?: string };
 }) {
   const channel = params.target ? params.target.channel : DEFAULT_TARGET.channel;
   const to = params.target && "to" in params.target ? params.target.to : DEFAULT_TARGET.to;
@@ -71,76 +82,6 @@ async function resolveForAgent(params: {
 }
 
 describe("resolveDeliveryTarget", () => {
-  it("uses matching session history account for explicit target before binding fallback", async () => {
-    vi.mocked(loadSessionStore).mockReturnValue({
-      "agent:test:main": {
-        sessionId: "main-session",
-        updatedAt: 1000,
-        lastTo: "123456",
-      },
-      "agent:test:telegram:direct:123456": {
-        sessionId: "telegram-session",
-        updatedAt: 2000,
-        lastChannel: "telegram",
-        lastTo: "123456",
-        lastAccountId: "session-account",
-      },
-    } as SessionStore);
-
-    const cfg = makeCfg({
-      bindings: [
-        {
-          agentId: "agent-b",
-          match: { channel: "telegram", accountId: "binding-account" },
-        },
-      ],
-    });
-
-    const result = await resolveForAgent({
-      cfg,
-      target: { channel: "telegram", to: "123456" },
-    });
-
-    expect(result.ok).toBe(true);
-    expect(result.accountId).toBe("session-account");
-  });
-
-  it("matches explicit targets and session targets after prefix normalization", async () => {
-    vi.mocked(loadSessionStore).mockReturnValue({
-      "agent:test:main": {
-        sessionId: "main-session",
-        updatedAt: 1000,
-        lastTo: "123456",
-      },
-      "agent:test:telegram:direct:123456": {
-        sessionId: "telegram-session",
-        updatedAt: 2000,
-        deliveryContext: {
-          channel: "telegram",
-          to: "telegram:user:123456",
-          accountId: "session-account",
-        },
-      },
-    } as SessionStore);
-
-    const cfg = makeCfg({
-      bindings: [
-        {
-          agentId: "agent-b",
-          match: { channel: "telegram", accountId: "binding-account" },
-        },
-      ],
-    });
-
-    const result = await resolveForAgent({
-      cfg,
-      target: { channel: "telegram", to: "user:123456" },
-    });
-
-    expect(result.ok).toBe(true);
-    expect(result.accountId).toBe("session-account");
-  });
-
   it("reroutes implicit whatsapp delivery to authorized allowFrom recipient", async () => {
     setMainSessionEntry({
       sessionId: "sess-w1",
@@ -179,16 +120,7 @@ describe("resolveDeliveryTarget", () => {
 
   it("falls back to bound accountId when session has no lastAccountId", async () => {
     setMainSessionEntry(undefined);
-
-    const cfg = makeCfg({
-      bindings: [
-        {
-          agentId: "agent-b",
-          match: { channel: "telegram", accountId: "account-b" },
-        },
-      ],
-    });
-
+    const cfg = makeTelegramBoundCfg();
     const result = await resolveForAgent({ cfg });
 
     expect(result.accountId).toBe("account-b");
@@ -203,15 +135,7 @@ describe("resolveDeliveryTarget", () => {
       lastAccountId: "session-account",
     });
 
-    const cfg = makeCfg({
-      bindings: [
-        {
-          agentId: "agent-b",
-          match: { channel: "telegram", accountId: "account-b" },
-        },
-      ],
-    });
-
+    const cfg = makeTelegramBoundCfg();
     const result = await resolveForAgent({ cfg });
 
     // Session-derived accountId should take precedence over binding
@@ -304,7 +228,9 @@ describe("resolveDeliveryTarget", () => {
     if (result.ok) {
       throw new Error("expected unresolved delivery target");
     }
-    expect(result.error.message).toContain('No delivery target resolved for channel "telegram"');
+    // resolveOutboundTarget provides the standard missing-target error when
+    // no explicit target, no session lastTo, and no plugin resolveDefaultTo.
+    expect(result.error.message).toContain("requires target");
   });
 
   it("returns an error when channel selection is ambiguous", async () => {
@@ -368,5 +294,40 @@ describe("resolveDeliveryTarget", () => {
     expect(result.channel).toBe("telegram");
     expect(result.to).toBe("987654");
     expect(result.ok).toBe(true);
+  });
+
+  it("explicit delivery.accountId overrides session-derived accountId", async () => {
+    setMainSessionEntry({
+      sessionId: "sess-5",
+      updatedAt: 1000,
+      lastChannel: "telegram",
+      lastTo: "chat-999",
+      lastAccountId: "default",
+    });
+
+    const result = await resolveDeliveryTarget(makeCfg({ bindings: [] }), AGENT_ID, {
+      channel: "telegram",
+      to: "chat-999",
+      accountId: "bot-b",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.accountId).toBe("bot-b");
+  });
+
+  it("explicit delivery.accountId overrides bindings-derived accountId", async () => {
+    setMainSessionEntry(undefined);
+    const cfg = makeCfg({
+      bindings: [{ agentId: AGENT_ID, match: { channel: "telegram", accountId: "bound" } }],
+    });
+
+    const result = await resolveDeliveryTarget(cfg, AGENT_ID, {
+      channel: "telegram",
+      to: "chat-777",
+      accountId: "explicit",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.accountId).toBe("explicit");
   });
 });

@@ -83,7 +83,7 @@ const coreEntries: CoreCliEntry[] = [
       {
         name: "config",
         description:
-          "Non-interactive config helpers (get/set/unset). Default: starts setup wizard.",
+          "Non-interactive config helpers (get/set/unset/file/validate). Default: starts setup wizard.",
         hasSubcommands: true,
       },
     ],
@@ -137,7 +137,7 @@ const coreEntries: CoreCliEntry[] = [
     commands: [
       {
         name: "memory",
-        description: "Search, audit, health-check, and reindex memory files",
+        description: "Search and reindex memory files",
         hasSubcommands: true,
       },
     ],

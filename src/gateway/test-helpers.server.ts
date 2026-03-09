@@ -100,27 +100,30 @@ async function setupGatewayTestHome() {
   delete process.env.OPENCLAW_CONFIG_PATH;
 }
 
-function applyGatewaySkipEnv() {
+function applyGatewaySkipEnv(options?: { minimalGateway?: boolean }) {
   process.env.OPENCLAW_SKIP_BROWSER_CONTROL_SERVER = "1";
   process.env.OPENCLAW_SKIP_GMAIL_WATCHER = "1";
   process.env.OPENCLAW_SKIP_CANVAS_HOST = "1";
   process.env.OPENCLAW_SKIP_CHANNELS = "1";
   process.env.OPENCLAW_SKIP_PROVIDERS = "1";
   process.env.OPENCLAW_SKIP_CRON = "1";
-  process.env.OPENCLAW_TEST_MINIMAL_GATEWAY = "1";
+  process.env.OPENCLAW_TEST_MINIMAL_GATEWAY = options?.minimalGateway === false ? "0" : "1";
   process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = tempHome
     ? path.join(tempHome, "openclaw-test-no-bundled-extensions")
     : "openclaw-test-no-bundled-extensions";
 }
 
-async function resetGatewayTestState(options: { uniqueConfigRoot: boolean }) {
+async function resetGatewayTestState(options: {
+  uniqueConfigRoot: boolean;
+  minimalGateway?: boolean;
+}) {
   // Some tests intentionally use fake timers; ensure they don't leak into gateway suites.
   vi.useRealTimers();
   setLoggerOverride({ level: "silent", consoleLevel: "silent" });
   if (!tempHome) {
     throw new Error("resetGatewayTestState called before temp home was initialized");
   }
-  applyGatewaySkipEnv();
+  applyGatewaySkipEnv({ minimalGateway: options.minimalGateway });
   if (options.uniqueConfigRoot) {
     const suiteRoot = path.join(tempHome, ".openclaw-test-suite");
     await fs.mkdir(suiteRoot, { recursive: true });
@@ -192,15 +195,19 @@ async function cleanupGatewayTestHome(options: { restoreEnv: boolean }) {
   }
 }
 
-export function installGatewayTestHooks(options?: { scope?: "test" | "suite" }) {
+export function installGatewayTestHooks(options?: {
+  scope?: "test" | "suite";
+  minimalGateway?: boolean;
+}) {
   const scope = options?.scope ?? "test";
+  const minimalGateway = options?.minimalGateway;
   if (scope === "suite") {
     beforeAll(async () => {
       await setupGatewayTestHome();
-      await resetGatewayTestState({ uniqueConfigRoot: true });
+      await resetGatewayTestState({ uniqueConfigRoot: true, minimalGateway });
     });
     beforeEach(async () => {
-      await resetGatewayTestState({ uniqueConfigRoot: true });
+      await resetGatewayTestState({ uniqueConfigRoot: true, minimalGateway });
     }, 60_000);
     afterEach(async () => {
       await cleanupGatewayTestHome({ restoreEnv: false });
@@ -213,7 +220,7 @@ export function installGatewayTestHooks(options?: { scope?: "test" | "suite" }) 
 
   beforeEach(async () => {
     await setupGatewayTestHome();
-    await resetGatewayTestState({ uniqueConfigRoot: false });
+    await resetGatewayTestState({ uniqueConfigRoot: false, minimalGateway });
   }, 60_000);
 
   afterEach(async () => {

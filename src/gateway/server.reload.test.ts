@@ -114,7 +114,7 @@ const hoisted = vi.hoisted(() => {
 
   const reloaderStop = vi.fn(async () => {});
   let onHotReload: ((plan: unknown, nextConfig: unknown) => Promise<void>) | null = null;
-  let onRestart: ((plan: unknown, nextConfig: unknown) => void | Promise<void>) | null = null;
+  let onRestart: ((plan: unknown, nextConfig: unknown) => void) | null = null;
 
   const startGatewayConfigReloader = vi.fn(
     (opts: { onHotReload: typeof onHotReload; onRestart: typeof onRestart }) => {
@@ -168,7 +168,7 @@ vi.mock("./config-reload.js", () => ({
   startGatewayConfigReloader: hoisted.startGatewayConfigReloader,
 }));
 
-installGatewayTestHooks({ scope: "suite" });
+installGatewayTestHooks({ scope: "suite", minimalGateway: false });
 
 describe("gateway hot reload", () => {
   let prevSkipChannels: string | undefined;

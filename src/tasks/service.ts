@@ -59,6 +59,15 @@ export class TaskService {
   private timer: NodeJS.Timeout | null = null;
   private started = false;
   private running = false;
+  private readonly inflight = new Set<Promise<unknown>>();
+
+  private track<T>(promise: Promise<T>): Promise<T> {
+    this.inflight.add(promise);
+    void promise.finally(() => {
+      this.inflight.delete(promise);
+    });
+    return promise;
+  }
 
   constructor(params: TaskServiceDeps) {
     this.loadConfig = params.loadConfig;
@@ -73,28 +82,33 @@ export class TaskService {
     }
     this.started = true;
     setActiveTaskRuntime(this);
-    await this.withStore(async (store) => {
-      const now = this.nowMs();
-      for (const task of store.tasks) {
-        if (task.status === "running") {
-          task.status = "queued";
-          task.nextWakeAtMs = now;
+    await this.track(
+      this.withStore(async (store) => {
+        const now = this.nowMs();
+        for (const task of store.tasks) {
+          if (task.status === "running") {
+            task.status = "queued";
+            task.nextWakeAtMs = now;
+          }
+          task.lease = undefined;
+          task.updatedAtMs = now;
         }
-        task.lease = undefined;
-        task.updatedAtMs = now;
-      }
-    });
+      }),
+    );
     this.armTimer();
     this.log.info(`started store=${this.storePath}`);
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     this.started = false;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     setActiveTaskRuntime(null);
+    if (this.inflight.size > 0) {
+      await Promise.allSettled(this.inflight);
+    }
   }
 
   async create(input: TaskCreateInput): Promise<TaskCreateResult> {
@@ -167,20 +181,22 @@ export class TaskService {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    void this.runDueTasks();
-    void this.withStore(async (store) => {
-      const now = this.nowMs();
-      const nextWake = this.findNextWake(store, now);
-      if (nextWake == null) {
-        return;
-      }
-      const delayMs = Math.max(0, nextWake - now);
-      this.timer = setTimeout(() => {
-        this.timer = null;
-        void this.runDueTasks();
-      }, delayMs);
-      this.timer.unref?.();
-    });
+    void this.track(this.runDueTasks());
+    void this.track(
+      this.withStore(async (store) => {
+        const now = this.nowMs();
+        const nextWake = this.findNextWake(store, now);
+        if (nextWake == null) {
+          return;
+        }
+        const delayMs = Math.max(0, nextWake - now);
+        this.timer = setTimeout(() => {
+          this.timer = null;
+          void this.track(this.runDueTasks());
+        }, delayMs);
+        this.timer.unref?.();
+      }),
+    );
   }
 
   private findNextWake(store: TaskStoreFile, now: number): number | null {

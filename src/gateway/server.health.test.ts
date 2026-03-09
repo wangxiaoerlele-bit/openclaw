@@ -6,7 +6,7 @@ import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-cha
 import { startGatewayServerHarness, type GatewayServerHarness } from "./server.e2e-ws-harness.js";
 import { installGatewayTestHooks, onceMessage } from "./test-helpers.js";
 
-installGatewayTestHooks({ scope: "suite" });
+installGatewayTestHooks({ scope: "suite", minimalGateway: false });
 const HEALTH_E2E_TIMEOUT_MS = 20_000;
 const PRESENCE_EVENT_TIMEOUT_MS = 6_000;
 const SHUTDOWN_EVENT_TIMEOUT_MS = 3_000;

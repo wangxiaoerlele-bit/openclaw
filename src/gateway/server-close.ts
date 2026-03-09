@@ -14,7 +14,7 @@ export function createGatewayCloseHandler(params: {
   stopChannel: (name: ChannelId, accountId?: string) => Promise<void>;
   pluginServices: PluginServicesHandle | null;
   cron: { stop: () => void };
-  taskService?: { stop: () => void } | null;
+  taskService?: { stop: () => void | Promise<void> } | null;
   heartbeatRunner: HeartbeatRunner;
   updateCheckStop?: (() => void) | null;
   nodePresenceTimers: Map<string, ReturnType<typeof setInterval>>;
@@ -71,7 +71,7 @@ export function createGatewayCloseHandler(params: {
     }
     await stopGmailWatcher();
     params.cron.stop();
-    params.taskService?.stop();
+    await params.taskService?.stop();
     params.heartbeatRunner.stop();
     try {
       params.updateCheckStop?.();

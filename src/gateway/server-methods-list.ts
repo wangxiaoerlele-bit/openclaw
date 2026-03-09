@@ -98,10 +98,6 @@ const BASE_METHODS = [
   "chat.history",
   "chat.abort",
   "chat.send",
-  "memory.applySuggestion",
-  "memory.suggestions.list",
-  "memory.suggestions.apply",
-  "memory.suggestions.dismiss",
 ];
 
 export function listGatewayMethods(): string[] {

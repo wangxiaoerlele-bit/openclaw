@@ -74,7 +74,7 @@ describe("TaskService", () => {
       }),
     );
 
-    service.stop();
+    await service.stop();
   });
 
   it("keeps later tasks queued while the first task is waiting on external work", async () => {
@@ -116,6 +116,53 @@ describe("TaskService", () => {
     expect(runTaskWorkerTurnMock).toHaveBeenCalledTimes(1);
     expect(store.tasks[1]?.status).toBe("queued");
 
-    service.stop();
+    await service.stop();
+  });
+
+  it("waits for an in-flight worker turn before stopping", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tasks-"));
+    const storePath = path.join(dir, "tasks.json");
+    let releaseWorker: (() => void) | undefined;
+    runTaskWorkerTurnMock.mockImplementationOnce(
+      async () =>
+        await new Promise((resolve) => {
+          releaseWorker = () =>
+            resolve({
+              status: "completed",
+              update: "done",
+              evidence: [],
+              sideEffects: 0,
+            });
+        }),
+    );
+    const service = new TaskService({
+      loadConfig: () => ({}) as never,
+      deps: {} as never,
+      storePath,
+    });
+
+    await service.start();
+    await service.create({
+      agentId: "main",
+      originSessionKey: "session-a",
+      goal: "任务 A",
+      acceptance: ["完成 A"],
+    });
+
+    await vi.waitFor(() => {
+      expect(runTaskWorkerTurnMock).toHaveBeenCalledTimes(1);
+    });
+
+    let stopped = false;
+    const stopPromise = service.stop().then(() => {
+      stopped = true;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(stopped).toBe(false);
+
+    releaseWorker?.();
+    await stopPromise;
+    expect(stopped).toBe(true);
   });
 });

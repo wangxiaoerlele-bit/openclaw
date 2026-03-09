@@ -232,6 +232,10 @@ await session.prompt(effectivePrompt, { images: imageResult.images });
 
 The SDK handles the full agent loop: sending to LLM, executing tool calls, streaming responses.
 
+Image injection is prompt-local: OpenClaw loads image refs from the current prompt and
+passes them via `images` for that turn only. It does not re-scan older history turns
+to re-inject image payloads.
+
 ## Tool Architecture
 
 ### Tool Pipeline
@@ -449,9 +453,6 @@ isRateLimitAssistantError(...)        // Rate limited
 isFailoverAssistantError(...)         // Should failover
 classifyFailoverReason(errorText)     // "auth" | "rate_limit" | "quota" | "timeout" | ...
 ```
-
-Timeout classification includes `stop reason: abort` and `stop reason: network_error` variants
-(including `Unhandled stop reason: ...`) so transport interruptions fail over consistently.
 
 ### Thinking Level Fallback
 

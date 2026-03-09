@@ -7,7 +7,7 @@ import type {
   MSTeamsConfig,
   MSTeamsReplyStyle,
   MSTeamsTeamConfig,
-} from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/msteams";
 import {
   buildChannelKeyCandidates,
   normalizeChannelSlug,
@@ -15,7 +15,7 @@ import {
   resolveToolsBySender,
   resolveChannelEntryMatchWithFallback,
   resolveNestedAllowlistDecision,
-} from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/msteams";
 
 export type MSTeamsResolvedRouteConfig = {
   teamConfig?: MSTeamsTeamConfig;
@@ -221,7 +221,7 @@ export function resolveMSTeamsReplyPolicy(params: {
   channelConfig?: MSTeamsChannelConfig;
 }): MSTeamsReplyPolicy {
   if (params.isDirectMessage) {
-    return { requireMention: false, replyStyle: "top-level" };
+    return { requireMention: false, replyStyle: "thread" };
   }
 
   const requireMention =

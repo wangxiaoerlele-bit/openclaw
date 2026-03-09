@@ -19,6 +19,7 @@ import {
   resolveSkillInvocationPolicy,
 } from "./frontmatter.js";
 import { resolvePluginSkillDirs } from "./plugin-skills.js";
+import { resolveSkillRuntimePathPrepend } from "./runtime-paths.js";
 import { serializeByKey } from "./serialize.js";
 import type {
   ParsedSkillFrontmatter,
@@ -456,6 +457,7 @@ export function buildWorkspaceSkillSnapshot(
       primaryEnv: entry.metadata?.primaryEnv,
       requiredEnv: entry.metadata?.requires?.env?.slice(),
     })),
+    runtimePathPrepend: resolveSkillRuntimePathPrepend(eligible),
     ...(skillFilter === undefined ? {} : { skillFilter }),
     resolvedSkills,
     version: opts?.snapshotVersion,

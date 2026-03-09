@@ -7,6 +7,7 @@ import {
   resolveRuntimePlatform,
 } from "../../shared/config-eval.js";
 import { resolveSkillKey } from "./frontmatter.js";
+import { hasSkillRuntimeBinary } from "./runtime-paths.js";
 import type { SkillEligibilityContext, SkillEntry } from "./types.js";
 
 const DEFAULT_CONFIG_VALUES: Record<string, boolean> = {
@@ -88,7 +89,7 @@ export function shouldIncludeSkill(params: {
     remotePlatforms: eligibility?.remote?.platforms,
     always: entry.metadata?.always,
     requires: entry.metadata?.requires,
-    hasBin: hasBinary,
+    hasBin: (bin) => hasSkillRuntimeBinary({ entry, bin }),
     hasRemoteBin: eligibility?.remote?.hasBin,
     hasAnyRemoteBin: eligibility?.remote?.hasAnyBin,
     hasEnv: (envName) =>

@@ -17,6 +17,7 @@ import {
   type SkillsInstallPreferences,
 } from "./skills.js";
 import { resolveBundledSkillsContext } from "./skills/bundled-context.js";
+import { hasSkillRuntimeBinary } from "./skills/runtime-paths.js";
 
 export type SkillStatusConfigCheck = RequirementConfigCheck;
 
@@ -195,7 +196,7 @@ function buildSkillStatus(
     evaluateEntryRequirementsForCurrentPlatform({
       always,
       entry,
-      hasLocalBin: hasBinary,
+      hasLocalBin: (bin) => hasSkillRuntimeBinary({ entry, bin }),
       remote: eligibility?.remote,
       isEnvSatisfied,
       isConfigSatisfied,

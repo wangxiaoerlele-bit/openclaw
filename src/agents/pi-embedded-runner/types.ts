@@ -74,6 +74,8 @@ export type EmbeddedPiRunResult = {
   messagingToolSentTargets?: MessagingToolSend[];
   // Count of successful cron.add tool calls in this run.
   successfulCronAdds?: number;
+  // Count of successful mutating tool calls in this run.
+  successfulMutatingToolCalls?: number;
 };
 
 export type EmbeddedPiCompactResult = {

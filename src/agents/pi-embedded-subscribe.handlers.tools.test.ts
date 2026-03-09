@@ -45,6 +45,7 @@ function createTestContext(): {
       messagingToolSentMediaUrls: [],
       messagingToolSentTargets: [],
       successfulCronAdds: 0,
+      successfulMutatingToolCalls: 0,
     },
     shouldEmitToolResult: () => false,
     shouldEmitToolOutput: () => false,
@@ -172,6 +173,60 @@ describe("handleToolExecutionEnd cron.add commitment tracking", () => {
     );
 
     expect(ctx.state.successfulCronAdds).toBe(0);
+  });
+});
+
+describe("handleToolExecutionEnd mutating tool tracking", () => {
+  it("increments successfulMutatingToolCalls for successful mutating tools", async () => {
+    const { ctx } = createTestContext();
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "write",
+        toolCallId: "tool-write-1",
+        args: { path: "/tmp/example.txt", content: "hello" },
+      } as never,
+    );
+
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "write",
+        toolCallId: "tool-write-1",
+        isError: false,
+        result: { ok: true },
+      } as never,
+    );
+
+    expect(ctx.state.successfulMutatingToolCalls).toBe(1);
+  });
+
+  it("does not increment successfulMutatingToolCalls for failed mutating tools", async () => {
+    const { ctx } = createTestContext();
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "write",
+        toolCallId: "tool-write-2",
+        args: { path: "/tmp/example.txt", content: "hello" },
+      } as never,
+    );
+
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "write",
+        toolCallId: "tool-write-2",
+        isError: true,
+        result: { error: "disk full" },
+      } as never,
+    );
+
+    expect(ctx.state.successfulMutatingToolCalls).toBe(0);
   });
 });
 
